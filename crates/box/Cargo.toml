@@ -101,11 +101,6 @@ path = "tests/support/exit_probe.rs"
 required-features = ["test-support"]
 
 [[bin]]
-name = "box-library-probe"
-path = "tests/support/library_probe.rs"
-required-features = ["test-support"]
-
-[[bin]]
 name = "box-inherited-handles-probe"
 path = "tests/support/inherited_handles_probe.rs"
 required-features = ["test-support"]
@@ -143,11 +138,6 @@ required-features = ["test-support"]
 [[test]]
 name = "box_inherited_handles"
 path = "tests/box_inherited_handles.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "box_library"
-path = "tests/box_library.rs"
 required-features = ["test-support"]
 
 [[test]]

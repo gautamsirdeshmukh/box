@@ -406,10 +406,7 @@ impl Contained {
 
     /// Wait for the workload, forwarding `SIGINT` and stopping it on `SIGTERM` or `SIGHUP`, and
     /// report its exit code.
-    pub(crate) async fn wait(
-        mut self,
-        stopped: impl Future<Output = ()>,
-    ) -> Result<ExitCode, BoxError> {
+    pub(crate) async fn wait(mut self) -> Result<ExitCode, BoxError> {
         // Release the box's copy of the status pipe first: until it is closed the
         // read below would block on the box itself.
         self.trampoline.close_setup_writer();
@@ -421,7 +418,6 @@ impl Contained {
             Hosted(BoxError),
         }
         let completion = tokio::select! {
-            () = stopped => Completion::Workload(self.group.stop().await),
             status = self.signals.wait_forwarding(&mut self.group) => {
                 Completion::Workload(status)
             }
@@ -438,7 +434,7 @@ impl Contained {
         };
         let setup_result = self.trampoline.setup_failure();
 
-        // The drain lives in `command::run::finish`, which is the one point every exit reaches —
+        // The drain moved to `command::run::execute`, which is the one point every exit reaches —
         // including the failures before a `HostedBox` exists. A run that ends in an error still
         // keeps its records, because this collector outlives the `?`-returns below.
 

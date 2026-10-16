@@ -79,17 +79,13 @@ interpreters and keep those files out of the agent's direct grants. See
 Link the `strands-box` package in `crates/box`, then call:
 
 ```rust,no_run
-let box_process = strands_box::start("/absolute/box.toml".into())?;
-let exit_code = box_process.wait()?;
+let exit_code = strands_box::run("/absolute/box.toml".into());
 ```
 
-`start` returns a running Box. The application can do other work before calling `wait` to get
-the exit result. Box handles signals and cleanup while the application continues. Dropping
-`box_process` stops the workload and waits for cleanup.
-
-Call `start` once per host process, before starting application threads or loading secrets.
-The workload uses the process's terminal. Ship the matching Box helper binaries beside the
-host application.
+This runs the existing Box command in the calling process and waits until it finishes.
+It uses the process's terminal and returns its exit
+code. Call it before starting application threads or loading secrets, and use one Box workload
+per host process. Ship the matching Box helper binaries beside the host application.
 
 ## Architecture
 

@@ -17,33 +17,48 @@ use std::process::ExitCode;
 use clap::Parser as _;
 
 use crate::command::cli::{Cli, Command, PolicyCommand};
-use crate::error::{BoxError, Internal};
+use crate::error::BoxError;
+use crate::run::hardening::Hardening;
 
 pub(crate) fn cli_main() -> ExitCode {
-    let outcome = match Cli::parse().command {
-        Command::Run { config, workload } => {
-            crate::Box::start(config, workload).and_then(crate::Box::wait)
+    execute(Cli::parse())
+}
+
+pub(crate) fn execute(cli: Cli) -> ExitCode {
+    // Harden before the runtime exists, so the call is single-threaded and precedes every secret
+    // this process will hold (`run::hardening`).
+    if matches!(cli.command, Command::Run { .. })
+        && let Err(error) = Hardening::apply()
+    {
+        eprintln!("strands-box: refusing to run: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("strands-box: failed to start async runtime: {error}");
+            return ExitCode::FAILURE;
         }
-        Command::Policy {
-            command: PolicyCommand::GenerateSchema { config, output_dir },
-        } => generate_schema(&config, &output_dir),
     };
-    match outcome {
+
+    // A plain multi-threaded runtime. The Shell is `!Send` and needs a `LocalSet`, but it builds its
+    // own runtime on its own thread, so a non-yielding Lua loop cannot pin the thread serving
+    match runtime.block_on(dispatch(cli)) {
         Ok(code) => code,
         Err(error) => {
-            match &error.0 {
-                Internal::Hardening(_) | Internal::Runtime(_) => eprintln!("strands-box: {error}"),
-                _ => eprintln!("strands-box: error: {error}"),
-            }
+            eprintln!("strands-box: error: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn generate_schema(
-    config: &std::path::Path,
-    output_dir: &std::path::Path,
-) -> Result<ExitCode, BoxError> {
-    let runtime = tokio::runtime::Runtime::new().map_err(Internal::Runtime)?;
-    runtime.block_on(policy::generate_schema(config, output_dir))
+/// Route one invocation to the verb it named.
+async fn dispatch(cli: Cli) -> Result<ExitCode, BoxError> {
+    match &cli.command {
+        Command::Run { config, workload } => run::execute(config, workload).await,
+        Command::Policy {
+            command: PolicyCommand::GenerateSchema { config, output_dir },
+        } => policy::generate_schema(config, output_dir).await,
+    }
 }

@@ -100,11 +100,6 @@ it believes it governs, so an operator who wants the prompts gone states the sam
 ### Box is a process, and it reads one complete configuration
 
 Box ships a binary and a library so external applications can call the existing run code.
-The library separates `start` from `wait` so the caller can continue while Box runs.
-The returned `Box` owns the run; dropping it stops the workload and waits for cleanup.
-Supervision runs between those calls, because delaying signal handling or cleanup until
-`wait` would leave a running workload without them. One host process accepts one start call,
-before application threads or secrets exist.
 A box has four inputs: policy, credentials, a name, and a workload.
 One `run --config FILE` supplies them: the file states a required `name`, a required absolute
 `box_dir`, and an `[agent]` table holding `command` and `workspace`. A trailing argv appends to
@@ -122,8 +117,7 @@ resolved secrets. There is no daemon and no supervisor. One shared process would
 plaintext secrets and signing keys in one address space, where a single memory-safety failure
 reaches them all. The caller supplies the absolute `box_dir`, and the `run` process holds an
 exclusive lock on `private/.lock` inside it for its whole life, so Box needs no lifecycle verbs: the
-caller drops the library's Box or ends the process to stop a box, and removes the directory to
-delete one. Two residuals stay
+caller ends the process to stop a box, and removes the directory to delete one. Two residuals stay
 open. A killed trusted process leaves the contained workload without a parent, on both platforms:
 nothing in the product sets `PR_SET_PDEATHSIG`. And the deny floor covers this box's own directory
 alone, so a `permit fs:read` can reach a sibling box's stored policy when both directories sit under
