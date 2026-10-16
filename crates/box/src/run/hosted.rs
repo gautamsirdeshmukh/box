@@ -1369,10 +1369,13 @@ while :; do :; done"#
             .testing_stage_catalog("alpha", "read")
             .expect("the finalizer starts");
 
-        let failure = tokio::time::timeout(std::time::Duration::from_secs(10), contained.wait())
-            .await
-            .expect("the fatal staging failure stops the supervised workload")
-            .expect_err("the run must report the durable staging failure");
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            contained.wait(std::future::pending()),
+        )
+        .await
+        .expect("the fatal staging failure stops the supervised workload")
+        .expect_err("the run must report the durable staging failure");
         assert!(
             failure
                 .to_string()
@@ -1497,7 +1500,7 @@ while :; do :; done"#
 
         let code = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            workload.contained.wait(),
+            workload.contained.wait(std::future::pending()),
         )
         .await
         .expect("the run ends once the leader has exited")
@@ -1533,7 +1536,7 @@ while :; do :; done"#
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            workload.contained.wait(),
+            workload.contained.wait(std::future::pending()),
         )
         .await
         .expect("the run ends after the signal");

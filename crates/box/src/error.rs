@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 /// Why a box refused to run, or stopped running.
 #[derive(Debug)]
-pub(crate) struct BoxError(Internal);
+pub struct BoxError(pub(crate) Internal);
 
 impl std::fmt::Display for BoxError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,6 +27,21 @@ impl<E: Into<Internal>> From<E> for BoxError {
 /// Anything that stops a box from running, one variant per owning phase or mechanism.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Internal {
+    #[error("only one Box can start in a host process")]
+    AlreadyStarted,
+
+    #[error("refusing to run: {0}")]
+    Hardening(crate::run::hardening::HardeningError),
+
+    #[error("failed to start async runtime: {0}")]
+    Runtime(#[source] std::io::Error),
+
+    #[error("cannot start the Box runtime thread: {0}")]
+    Thread(#[source] std::io::Error),
+
+    #[error("the Box runtime thread stopped unexpectedly")]
+    Task,
+
     #[error(transparent)]
     Config(#[from] ConfigError),
 

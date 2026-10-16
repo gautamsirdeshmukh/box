@@ -73,8 +73,12 @@ fn write_credential_stores(
     Ok(())
 }
 
-/// Run one contained agent from one locked configuration snapshot.
-pub(crate) async fn execute(config: &Path, argv: &[OsString]) -> Result<ExitCode, BoxError> {
+/// Start one contained agent from one locked configuration snapshot.
+pub(crate) async fn start(
+    config: &Path,
+    argv: &[OsString],
+    stopped: tokio::sync::oneshot::Receiver<()>,
+) -> Result<impl Future<Output = Result<ExitCode, BoxError>> + use<>, BoxError> {
     let locked = prepare(config, argv)?;
     locked.announce_credential_stores()?;
     let collector = telemetry::open(&locked.root, &locked.record)?;
@@ -84,31 +88,41 @@ pub(crate) async fn execute(config: &Path, argv: &[OsString]) -> Result<ExitCode
         &name,
     ));
 
-    let outcome = hosted(locked, Arc::clone(&collector)).await;
-
-    // The one teardown point, so every exit above records the stop and every queued record
-    // reaches its target. `drained` is the only route out of the collector's queue, and the
-    // `?`-returns above reach no `HostedBox` to drain from. A workload that exits non-zero is
-    // still `Ok`, because the box did its work; only a `BoxError` is the box's own failure.
-    collector.control(match &outcome {
-        Ok(_) => {
-            telemetry::ControlRecord::completed(telemetry::ControlOperation::BoxStopped, &name)
+    let contained = match hosted(locked, Arc::clone(&collector)).await {
+        Ok(contained) => contained,
+        Err(error) => {
+            finish(&collector, &name, Some(&error)).await;
+            return Err(error);
         }
-        Err(refusal) => telemetry::ControlRecord::refused(
+    };
+    Ok(async move {
+        let outcome = contained
+            .wait(async {
+                let _ = stopped.await;
+            })
+            .await;
+        finish(&collector, &name, outcome.as_ref().err()).await;
+        outcome
+    })
+}
+
+async fn finish(collector: &telemetry::Collector, name: &str, error: Option<&BoxError>) {
+    collector.control(match error {
+        None => telemetry::ControlRecord::completed(telemetry::ControlOperation::BoxStopped, name),
+        Some(refusal) => telemetry::ControlRecord::refused(
             telemetry::ControlOperation::BoxStopped,
-            &name,
+            name,
             &refusal.to_string(),
         ),
     });
     collector.drained().await;
-    outcome
 }
 
-/// Open this box's authority, translate every declared process, and supervise the agent.
+/// Open this box's authority, translate every declared process, and start the agent.
 async fn hosted(
     locked: LockedRun,
     collector: Arc<telemetry::Collector>,
-) -> Result<ExitCode, BoxError> {
+) -> Result<Contained, BoxError> {
     let sources: Vec<Policy> = locked.policy.into_iter().collect();
     let subject = policy_subject(&sources);
     let operator = crate::record::config::policy_operator()?;
@@ -206,8 +220,7 @@ async fn hosted(
         &site,
     )?;
     eprintln!("{}", boundary.disclosure());
-    let contained = Contained::spawn(boundary, &locked.root, hosted).await?;
-    contained.wait().await
+    Contained::spawn(boundary, &locked.root, hosted).await
 }
 
 /// The agent's `HOME`: its `env.HOME`, else the operator's own home.
