@@ -99,7 +99,7 @@ it believes it governs, so an operator who wants the prompts gone states the sam
 <a id="box-is-a-process-and-reads-one-complete-configuration"></a>
 ### Box is a process, and it reads one complete configuration
 
-Box ships a binary and a library so Boxy can call the existing run code.
+Box ships a binary and a library so external applications can call the existing run code.
 A box has four inputs: policy, credentials, a name, and a workload.
 One `run --config FILE` supplies them: the file states a required `name`, a required absolute
 `box_dir`, and an `[agent]` table holding `command` and `workspace`. A trailing argv appends to
