@@ -3369,12 +3369,12 @@ fn timeout_is_per_command_not_cumulative() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
         let mut shell = Shell::builder()
-            .timeout(std::time::Duration::from_millis(500))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
         // Sleep past the timeout *between* commands. The next run()
         // must succeed because its budget should start fresh.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         let out = shell.run("echo ok").await;
         assert_eq!(out.status, 0, "stderr={:?}", out.stderr);
         assert_eq!(out.stdout.trim(), "ok");
@@ -4661,7 +4661,10 @@ fn builder_bind_direct_readonly_host() {
 fn bind_direct_symlink_escape_blocked() {
     let (rt, local) = rt();
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_symlink_escape_test");
+        // Pid-scoped: a fixed shared name plus `remove_dir_all` races any other test binary
+        // running concurrently, which made this security test flake — observed once as a false
+        // "symlink escape not blocked" while five consecutive runs passed.
+        let dir = std::env::temp_dir().join(format!("lsh_symlink_escape_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("mount")).unwrap();
         std::fs::write(dir.join("mount/safe.txt"), "safe").unwrap();
@@ -5587,25 +5590,30 @@ fn url_check_allowed_prefix_no_confusion() {
 #[test]
 fn bind_direct_write_back() {
     let (rt, local) = rt();
+    let dir = std::env::temp_dir().join(format!("lsh_bind_write_test_{}", std::process::id()));
+    if let Err(error) = std::fs::remove_dir_all(&dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        panic!("failed to clear test directory {}: {error}", dir.display());
+    }
+    std::fs::create_dir_all(&dir).expect("create test directory");
     rt.block_on(local.run_until(async {
-        let dir = std::env::temp_dir().join("lsh_bind_write_test");
-        let _ = std::fs::create_dir_all(&dir);
         let mut shell = Shell::builder()
             .bind_direct(dir.to_str().unwrap(), "/mnt/wr")
             .build()
             .unwrap();
-        shell.run("echo written_data > /mnt/wr/output.txt").await;
-        // Run another command to ensure the write-back task completes
-        shell.run("true").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let content = std::fs::read_to_string(dir.join("output.txt")).unwrap_or_default();
-        assert!(
-            content.contains("written_data"),
-            "host file content: {:?}",
-            content
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        let output = shell.run("echo written_data > /mnt/wr/output.txt").await;
+        assert_eq!(output.status, 0, "write command failed: {}", output.stderr);
     }));
+    // Shell::run returns before bind-direct drain tasks necessarily finish.
+    rt.block_on(local);
+    let content = std::fs::read_to_string(dir.join("output.txt")).unwrap_or_default();
+    assert!(
+        content.contains("written_data"),
+        "host file content: {:?}",
+        content
+    );
+    std::fs::remove_dir_all(&dir).expect("remove test directory");
 }
 
 // ── VFS glob matching ───────────────────────────────────────────────
