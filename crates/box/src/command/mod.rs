@@ -14,19 +14,12 @@ pub(crate) mod run;
 
 use std::process::ExitCode;
 
-use clap::Parser as _;
-
 use crate::command::cli::{Cli, Command, PolicyCommand};
 use crate::error::BoxError;
 use crate::run::hardening::Hardening;
 
-pub(crate) fn cli_main() -> ExitCode {
-    execute(Cli::parse())
-}
-
 pub(crate) fn execute(cli: Cli) -> ExitCode {
-    // Harden before the runtime exists, so the call is single-threaded and precedes every secret
-    // this process will hold (`run::hardening`).
+    // Disable core dumps and restrict process-memory inspection before Box starts its runtime or loads credentials.
     if matches!(cli.command, Command::Run { .. })
         && let Err(error) = Hardening::apply()
     {
