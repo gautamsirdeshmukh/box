@@ -1,4 +1,11 @@
-//! Run workloads inside a zero-trust box through the command line or library.
+//! `strands-box` runs workloads inside a zero-trust box through the command line or library.
+//!
+//! | Module | Owns |
+//! |---|---|
+//! | [`command`] | one module per verb, and the argv parser |
+//! | [`record`] | what a box *is*, before anything is running |
+//! | [`run`] | one box's trusted half, alive for one run |
+//! | [`error`] | the typed taxonomy, one variant group per phase |
 
 #![warn(missing_docs, unreachable_pub)]
 
