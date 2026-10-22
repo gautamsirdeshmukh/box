@@ -477,7 +477,7 @@ impl Contained {
             None => Signals::listen()?,
         };
         if own_terminal {
-            signals.retain_for_host();
+            signals.restore_default = false;
         }
         let (stdin, stdout, stderr) = match terminal {
             Some(file) => {
@@ -955,9 +955,6 @@ pub(crate) struct Signals {
 }
 
 impl Signals {
-    pub(crate) fn retain_for_host(&mut self) {
-        self.restore_default = false;
-    }
     pub(crate) fn listen() -> Result<Self, BoxError> {
         #[cfg(unix)]
         {

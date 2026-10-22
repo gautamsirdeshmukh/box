@@ -18,7 +18,7 @@ use crate::command::cli::{Cli, Command, PolicyCommand};
 use crate::error::BoxError;
 use crate::run::hardening::Hardening;
 
-pub(crate) fn execute(cli: Cli, mut options: crate::RunOptions<'_>) -> ExitCode {
+pub(crate) fn execute(cli: Cli, options: crate::RunOptions<'_>) -> ExitCode {
     // Disable core dumps and restrict process-memory inspection before Box starts its runtime or loads credentials.
     if matches!(cli.command, Command::Run { .. })
         && let Err(error) = Hardening::apply()
@@ -38,16 +38,12 @@ pub(crate) fn execute(cli: Cli, mut options: crate::RunOptions<'_>) -> ExitCode 
     // A plain multi-threaded runtime. The Shell is `!Send` and needs a `LocalSet`, but it builds its
     // own runtime on its own thread, so a non-yielding Lua loop cannot pin the thread serving
     match runtime.block_on(async {
-        let signals = if options.on_ready.is_some() && matches!(cli.command, Command::Run { .. }) {
-            let mut signals = crate::run::contain::supervise::Signals::listen()?;
-            if options.terminal.is_some() {
-                signals.retain_for_host();
-            }
-            Some(signals)
+        let signals = if options.on_ready.is_some() {
+            Some(crate::run::contain::supervise::Signals::listen()?)
         } else {
             None
         };
-        if let Some(on_ready) = options.on_ready.take() {
+        if let Some(on_ready) = options.on_ready {
             on_ready().map_err(|source| crate::error::SuperviseError::Control {
                 reason: format!("host terminal setup failed: {source}"),
             })?;
