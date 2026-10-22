@@ -124,6 +124,7 @@ impl ProcessGroup {
         if own_terminal {
             #[cfg(target_os = "linux")]
             die_with_parent(&mut command);
+            // SAFETY: stdio is set before this syscall-only hook; setsid precedes claiming fd 0 as the controlling terminal.
             unsafe {
                 command.pre_exec(|| {
                     if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
@@ -1217,6 +1218,91 @@ mod tests {
             signals.hangup.is_none(),
             "an ignored SIGHUP gets no listener"
         );
+    }
+
+    #[tokio::test]
+    async fn a_supplied_terminal_becomes_the_workloads_controlling_terminal() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty writes two descriptors; null options select the defaults.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned two owned descriptors.
+        let (master, slave) = unsafe {
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        };
+        for descriptor in [&master, &slave] {
+            // SAFETY: fcntl changes flags on these owned, open descriptors.
+            assert_ne!(
+                unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1
+            );
+        }
+        let mut command = Command::new("/bin/sleep");
+        command
+            .env_clear()
+            .arg("60")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        let mut group = ProcessGroup::spawn_with_terminal(command, true)
+            .await
+            .unwrap();
+        let leader = group.leader_pid().unwrap();
+        // SAFETY: the child is alive and the owned PTY master stays open.
+        unsafe {
+            assert_eq!(libc::getsid(leader), leader);
+            assert_eq!(libc::tcgetpgrp(master.as_raw_fd()), leader);
+        }
+        let status = tokio::time::timeout(Duration::from_secs(5), group.stop())
+            .await
+            .expect("terminal workload stops")
+            .unwrap();
+        assert!(!status.success(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_preserves_the_hosts_signal_handlers() {
+        let _signals = SIGNALS.lock().await;
+        let _listening = Signals::listen().unwrap();
+        for signal in [libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: initialized sigaction storage and a null action only read the disposition.
+            let mut before: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(signal, std::ptr::null(), &mut before) },
+                0
+            );
+            let mut command = Command::new("/bin/sleep");
+            command.arg("60");
+            let mut group = ProcessGroup::spawn(command).await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                ended_by(Some(()), signal, false, &mut group),
+            )
+            .await;
+            // SAFETY: read the resulting disposition, then restore the saved action before assertions.
+            let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe {
+                assert_eq!(libc::sigaction(signal, std::ptr::null(), &mut after), 0);
+                assert_eq!(libc::sigaction(signal, &before, std::ptr::null_mut()), 0);
+            }
+            assert!(!result.expect("shutdown is bounded").unwrap().success());
+            assert_eq!(after.sa_sigaction, before.sa_sigaction);
+        }
     }
 
     /// `stop` ends a group that ignores `SIGTERM`: the bounded wait runs out and `SIGKILL` follows,

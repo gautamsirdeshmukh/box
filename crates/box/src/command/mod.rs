@@ -45,7 +45,7 @@ pub(crate) fn execute(cli: Cli, options: crate::RunOptions<'_>) -> ExitCode {
         };
         if let Some(on_ready) = options.on_ready {
             on_ready().map_err(|source| crate::error::SuperviseError::Control {
-                reason: format!("host terminal setup failed: {source}"),
+                reason: format!("on_ready callback failed: {source}"),
             })?;
         }
         dispatch(cli, options.terminal, signals).await
