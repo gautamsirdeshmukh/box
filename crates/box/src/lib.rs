@@ -25,23 +25,35 @@ use command::cli::{Cli, Command, PolicyCommand};
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
+#[derive(Default)]
+pub struct RunOptions<'a> {
+    pub terminal: Option<std::fs::File>,
+    pub on_ready: Option<Box<dyn FnOnce() -> std::io::Result<()> + 'a>>,
+}
+
 /// Run the existing Box command with a configuration.
-pub fn run(config: PathBuf, workload: Vec<OsString>) -> ExitCode {
+pub fn run(config: PathBuf, workload: Vec<OsString>, options: RunOptions<'_>) -> ExitCode {
     if STARTED.swap(true, Ordering::SeqCst) {
         eprintln!("strands-box: refusing to run: this process already attempted to run a box");
         return ExitCode::FAILURE;
     }
 
-    command::execute(Cli {
-        command: Command::Run { config, workload },
-    })
+    command::execute(
+        Cli {
+            command: Command::Run { config, workload },
+        },
+        options,
+    )
 }
 
 /// Generate policy action and event schemas from a Box configuration.
 pub fn generate_policy_schema(config: PathBuf, output_dir: PathBuf) -> ExitCode {
-    command::execute(Cli {
-        command: Command::Policy {
-            command: PolicyCommand::GenerateSchema { config, output_dir },
+    command::execute(
+        Cli {
+            command: Command::Policy {
+                command: PolicyCommand::GenerateSchema { config, output_dir },
+            },
         },
-    })
+        RunOptions::default(),
+    )
 }
