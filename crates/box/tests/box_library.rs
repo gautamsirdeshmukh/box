@@ -51,7 +51,7 @@ fn hardening_and_repeat_run() {
 
     let directory = tempfile::tempdir().expect("create test directory");
     let config = directory.path().join("missing.toml");
-    let exit_code = strands_box::run(config.clone(), Vec::new());
+    let exit_code = strands_box::run(config.clone(), Vec::new(), Default::default());
     assert_eq!(exit_code, std::process::ExitCode::FAILURE);
 
     // SAFETY: getrlimit writes to the initialized limits value.
@@ -68,7 +68,7 @@ fn hardening_and_repeat_run() {
     }
 
     assert_eq!(
-        strands_box::run(config, Vec::new()),
+        strands_box::run(config, Vec::new(), Default::default()),
         std::process::ExitCode::FAILURE
     );
 }
