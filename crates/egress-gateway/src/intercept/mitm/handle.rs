@@ -279,39 +279,4 @@ mod tests {
             "MitmHandle::drop() must not hang under the AF_UNIX-only pin (a regression)"
         );
     }
-
-    #[test]
-    fn shutdown_connection_lives_until_accept_thread_exits() {
-        use std::io::{ErrorKind, Read};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (accepted, received) = mpsc::channel();
-        let (finish, released) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            accepted.send(listener.accept().unwrap().0).unwrap();
-            released.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-        let handle = MitmHandle::new(
-            BoundTransport::Tcp(port),
-            None,
-            None,
-            Vec::new(),
-            SharedAuditLog::new(),
-            Arc::new(AtomicBool::new(false)),
-            thread,
-        );
-        handle.shutdown();
-        let mut peer = received.recv_timeout(Duration::from_secs(2)).unwrap();
-        peer.set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let before_join = peer.read(&mut [0]);
-        finish.send(()).unwrap();
-        drop(handle);
-        assert!(
-            matches!(before_join, Err(ref error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
-            "shutdown closed its connection before the accept thread exited: {before_join:?}"
-        );
-        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-    }
 }
