@@ -123,8 +123,7 @@ impl MitmHandle {
         if self.stop.swap(true, Ordering::SeqCst) {
             return; // already shutting down
         }
-        // Unblock the blocking `accept()` by opening (and dropping) a throwaway connection over the
-        // same transport the accept loop is waiting on.
+        // Keep the wakeup connection open until the accept thread exits.
         let connection = match &self.transport {
             BoundTransport::Tcp(port) => {
                 std::net::TcpStream::connect(("127.0.0.1", *port)).map(OwnedFd::from)
