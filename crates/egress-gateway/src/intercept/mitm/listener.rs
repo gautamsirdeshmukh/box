@@ -2,86 +2,205 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-
-use crate::audit::RequestId;
 
 use super::SharedState;
 use super::connect::{self, ConnectRequest};
 use super::resolve::PinnedDestination;
+use crate::audit::RequestId;
 use crate::audit::{Decision as AuditDecision, EgressDecision, NetworkAuditEvent};
 use crate::effect::{ClaimedEffectPermit, EffectAttempt, EffectOutcome};
 use crate::error::ProxyError;
 
-/// A counting semaphore bounding the number of in-flight connection threads, with no external
-/// dependency. `acquire` blocks the accept loop until a slot frees, so
+struct Running {
+    available: usize,
+    _wakeup: UnixStream,
+}
+
+/// A counting semaphore bounding the number of in-flight connection threads, with a shutdown
+/// wakeup. `acquire` blocks the accept loop until a slot frees or shutdown begins, so
 /// an untrusted workload cannot make the adapter spawn unbounded OS threads (backpressure, not an
-/// optimization). Each [`Permit`] releases its slot on drop.
-struct ConnectionLimiter {
-    available: Mutex<usize>,
+/// optimization). Each [`Permit`] releases its slot on drop while admission is running.
+pub(super) struct AcceptControl {
+    running: Mutex<Option<Running>>,
     freed: Condvar,
 }
 
-impl ConnectionLimiter {
-    fn new(max: usize) -> Self {
-        Self {
-            // A zero cap would deadlock the accept loop; clamp to at least one slot.
-            available: Mutex::new(max.max(1)),
-            freed: Condvar::new(),
-        }
+impl AcceptControl {
+    pub(super) fn new(max: usize) -> io::Result<(Arc<Self>, UnixStream)> {
+        let (reader, writer) = UnixStream::pair()?;
+        Ok((
+            Arc::new(Self {
+                running: Mutex::new(Some(Running {
+                    // A zero cap would deadlock the accept loop; clamp to at least one slot.
+                    available: max.max(1),
+                    _wakeup: writer,
+                })),
+                freed: Condvar::new(),
+            }),
+            reader,
+        ))
     }
 
-    /// Block until a slot is free, then take it. Returns a [`Permit`] that releases on drop.
-    fn acquire(self: &Arc<Self>) -> Permit {
-        let mut available = self.available.lock().unwrap_or_else(|e| e.into_inner());
-        while *available == 0 {
-            available = self
-                .freed
-                .wait(available)
-                .unwrap_or_else(|e| e.into_inner());
-        }
-        *available -= 1;
-        Permit {
-            limiter: self.clone(),
+    pub(super) fn shutdown(&self) {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.freed.notify_all();
+    }
+
+    /// Block until a slot is free, then take it. Returns `None` if admission has shut down.
+    /// A returned [`Permit`] releases its slot on drop while admission is running.
+    fn acquire(self: &Arc<Self>) -> Option<Permit> {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let state = running.as_mut()?;
+            if state.available > 0 {
+                state.available -= 1;
+                return Some(Permit {
+                    control: self.clone(),
+                });
+            }
+            running = self.freed.wait(running).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
 
-/// A held connection slot; returns it to the [`ConnectionLimiter`] on drop.
+/// A held connection slot; returns it to the running [`AcceptControl`] on drop.
 struct Permit {
-    limiter: Arc<ConnectionLimiter>,
+    control: Arc<AcceptControl>,
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut available = self
-            .limiter
-            .available
+        let mut running = self
+            .control
+            .running
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *available += 1;
-        self.limiter.freed.notify_one();
+        if let Some(state) = running.as_mut() {
+            state.available += 1;
+            self.control.freed.notify_one();
+        }
     }
 }
 
-/// Run the accept loop until `stop` is set. Each connection is handled on its own thread,
+pub(super) fn next_stream<T>(
+    listener: &impl AsRawFd,
+    wakeup: &UnixStream,
+    mut accept: impl FnMut() -> io::Result<T>,
+) -> io::Result<Option<T>> {
+    loop {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: wakeup.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptors[0].revents != 0 {
+            return Ok(None);
+        }
+        if descriptors[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other("listener poll failed"));
+        }
+        match accept() {
+            Ok(stream) => return Ok(Some(stream)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK)
+                ) =>
+            {
+                return Err(error);
+            }
+            Err(_) => {
+                if stop_during_backoff(wakeup)? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+fn stop_during_backoff(wakeup: &UnixStream) -> io::Result<bool> {
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    loop {
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let mut descriptor = libc::pollfd {
+            fd: wakeup.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = (remaining.as_millis() + 1) as i32;
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result >= 0 {
+            return Ok(result > 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Run the accept loop until shutdown. Each connection is handled on its own thread,
 /// **bounded** by `config.max_connections`: the loop blocks on a free slot before accepting more, so
 /// an untrusted workload cannot exhaust the host with unbounded threads.
-pub(super) fn accept_loop(listener: TcpListener, state: Arc<SharedState>, stop: Arc<AtomicBool>) {
-    let limiter = Arc::new(ConnectionLimiter::new(state.config.max_connections));
-    for incoming in listener.incoming() {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let stream = match incoming {
-            Ok(s) => s,
-            Err(_) => continue,
+pub(super) fn accept_loop(
+    listener: TcpListener,
+    state: Arc<SharedState>,
+    control: Arc<AcceptControl>,
+    wakeup: UnixStream,
+) {
+    // Block here until a connection slot is free (backpressure), then hand the permit to the
+    // worker thread so the slot is released when the connection finishes.
+    while let Some(permit) = control.acquire() {
+        let stream = match next_stream(&listener, &wakeup, || {
+            listener.accept().map(|(stream, _)| stream)
+        }) {
+            Ok(Some(stream)) => stream,
+            Ok(None) => break,
+            Err(error) => {
+                state.audit.push(NetworkAuditEvent::deny(
+                    "-",
+                    0,
+                    format!("listener error: {error}"),
+                    RequestId::new("egress-listener-error"),
+                ));
+                break;
+            }
         };
-        // Block here until a connection slot is free (backpressure), then hand the permit to the
-        // worker thread so the slot is released when the connection finishes.
-        let permit = limiter.acquire();
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         let state = state.clone();
         std::thread::spawn(move || {
             // The permit lives for the duration of the connection; dropping it frees the slot.
@@ -258,8 +377,8 @@ fn handle_plain_http(
     )
 }
 
-/// Run the AF_UNIX accept loop until `stop` is set. A near-duplicate of
-/// [`accept_loop`] with `UnixStream` in place of `TcpStream`: same [`ConnectionLimiter`] backpressure,
+/// Run the AF_UNIX accept loop until shutdown. A near-duplicate of
+/// [`accept_loop`] with `UnixStream` in place of `TcpStream`: same [`AcceptControl`] backpressure,
 /// same per-connection thread model, same audit-on-handler-error. It exists because the workload under
 /// the AF_UNIX egress pin cannot create an `AF_INET` socket at all — a TCP listener would serve no one —
 /// so the proxy binds only the AF_UNIX socket and speaks the identical CONNECT/TLS/L7 protocol over it.
@@ -268,19 +387,29 @@ fn handle_plain_http(
 pub(super) fn accept_loop_unix(
     listener: UnixListener,
     state: Arc<SharedState>,
-    stop: Arc<AtomicBool>,
+    control: Arc<AcceptControl>,
+    wakeup: UnixStream,
 ) {
-    let limiter = Arc::new(ConnectionLimiter::new(state.config.max_connections));
-    for incoming in listener.incoming() {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let stream = match incoming {
-            Ok(s) => s,
-            Err(_) => continue,
+    // Same backpressure as the TCP loop: block on a free slot before accepting more.
+    while let Some(permit) = control.acquire() {
+        let stream = match next_stream(&listener, &wakeup, || {
+            listener.accept().map(|(stream, _)| stream)
+        }) {
+            Ok(Some(stream)) => stream,
+            Ok(None) => break,
+            Err(error) => {
+                state.audit.push(NetworkAuditEvent::deny(
+                    "-",
+                    0,
+                    format!("listener error: {error}"),
+                    RequestId::new("egress-listener-error"),
+                ));
+                break;
+            }
         };
-        // Same backpressure as the TCP loop: block on a free slot before accepting more.
-        let permit = limiter.acquire();
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         let state = state.clone();
         std::thread::spawn(move || {
             let _permit = permit;
@@ -585,14 +714,19 @@ fn write_status<S: Write>(stream: &mut S, status: u16, msg: &str) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// The limiter caps concurrent permits and blocks a further acquire until one is released.
     #[test]
     fn limiter_caps_and_releases() {
-        let limiter = Arc::new(ConnectionLimiter::new(2));
+        let (limiter, _wakeup) = AcceptControl::new(2).unwrap();
         let a = limiter.acquire();
         let b = limiter.acquire();
-        assert_eq!(*limiter.available.lock().unwrap(), 0, "both slots taken");
+        assert_eq!(
+            limiter.running.lock().unwrap().as_ref().unwrap().available,
+            0,
+            "both slots taken"
+        );
 
         // A third acquire on another thread must block until a slot frees.
         let limiter2 = limiter.clone();
@@ -606,14 +740,21 @@ mod tests {
         drop(a); // free one slot → the blocked acquire proceeds
         handle.join().unwrap();
         drop(b);
-        assert_eq!(*limiter.available.lock().unwrap(), 2, "all slots returned");
+        assert_eq!(
+            limiter.running.lock().unwrap().as_ref().unwrap().available,
+            2,
+            "all slots returned"
+        );
     }
 
     /// A zero cap is clamped to one slot so the accept loop can never deadlock on a misconfig.
     #[test]
     fn zero_cap_is_clamped_to_one() {
-        let limiter = Arc::new(ConnectionLimiter::new(0));
-        assert_eq!(*limiter.available.lock().unwrap(), 1);
+        let (limiter, _wakeup) = AcceptControl::new(0).unwrap();
+        assert_eq!(
+            limiter.running.lock().unwrap().as_ref().unwrap().available,
+            1
+        );
         let _permit = limiter.acquire(); // does not deadlock
     }
 
@@ -1038,5 +1179,195 @@ mod tests {
         assert_eq!(fixture.refused.addr.port(), fixture.dead.port());
         confirm_closed(fixture.dead).unwrap();
         fixture.refused.assert_live();
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::os::unix::thread::JoinHandleExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn observed_signal(_: libc::c_int) {
+        SIGNALS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn wait_resumes_after_interrupted_poll() {
+        const CHILD: &str = "EGRESS_TEST_INTERRUPTED_POLL";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "intercept::mitm::listener::cancellation_tests::wait_resumes_after_interrupted_poll",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (control, wakeup) = AcceptControl::new(1).unwrap();
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = observed_signal as *const () as usize;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR1, &action, &mut old) },
+            0
+        );
+        let thread = std::thread::spawn(move || {
+            next_stream(&listener, &wakeup, || listener.accept())
+                .unwrap()
+                .is_some()
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        for _ in 0..5 {
+            assert_eq!(
+                unsafe { libc::pthread_kill(thread.as_pthread_t() as _, libc::SIGUSR1) },
+                0
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(SIGNALS.load(Ordering::SeqCst) > 0);
+        assert!(!thread.is_finished());
+        let client = TcpStream::connect(address).unwrap();
+        assert!(thread.join().unwrap());
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) },
+            0
+        );
+        drop(client);
+        control.shutdown();
+    }
+
+    #[test]
+    fn shutdown_cancels_a_full_connection_limit() {
+        let (control, _wakeup) = AcceptControl::new(1).unwrap();
+        let permit = control.acquire().unwrap();
+        let (started, entered) = std::sync::mpsc::channel();
+        let (sent, received) = std::sync::mpsc::channel();
+        let waiting = control.clone();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            sent.send(waiting.acquire().is_none()).unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        control.shutdown();
+        assert!(received.recv_timeout(Duration::from_secs(1)).unwrap());
+        thread.join().unwrap();
+        drop(permit);
+        assert!(control.acquire().is_none());
+    }
+
+    #[test]
+    fn stale_readiness_returns_to_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (control, wakeup) = AcceptControl::new(1).unwrap();
+        let first = TcpStream::connect(address).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut stale = true;
+            next_stream(&listener, &wakeup, || {
+                let accepted = listener.accept()?;
+                if stale {
+                    stale = false;
+                    drop(accepted);
+                    tx.send(()).unwrap();
+                    Err(io::ErrorKind::WouldBlock.into())
+                } else {
+                    Ok(accepted)
+                }
+            })
+            .unwrap()
+            .is_some()
+        });
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!thread.is_finished());
+        let second = TcpStream::connect(address).unwrap();
+        assert!(thread.join().unwrap());
+        drop((first, second));
+        control.shutdown();
+    }
+
+    #[test]
+    fn accept_recovers_from_client_and_resource_errors() {
+        for code in [
+            libc::ECONNABORTED,
+            libc::ECONNRESET,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (control, wakeup) = AcceptControl::new(1).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let mut calls = 0;
+            let accepted = next_stream(&listener, &wakeup, || {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::Error::from_raw_os_error(code))
+                } else {
+                    listener.accept()
+                }
+            })
+            .unwrap();
+            assert!(accepted.is_some());
+            assert_eq!(calls, 2);
+            drop(client);
+            control.shutdown();
+        }
+    }
+
+    #[test]
+    fn shutdown_cancels_resource_error_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (control, wakeup) = AcceptControl::new(1).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result: io::Result<Option<TcpStream>> = next_stream(&listener, &wakeup, || {
+                let _ = attempt_tx.send(());
+                Err(io::Error::from_raw_os_error(libc::EMFILE))
+            });
+            done_tx.send(result.unwrap().is_none()).unwrap();
+        });
+        attempt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        control.shutdown();
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        thread.join().unwrap();
+        drop(client);
+    }
+
+    #[test]
+    fn unusable_listener_errors_return() {
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (control, wakeup) = AcceptControl::new(1).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let result: io::Result<Option<TcpStream>> = next_stream(&listener, &wakeup, || {
+                Err(io::Error::from_raw_os_error(code))
+            });
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+            drop(client);
+            control.shutdown();
+        }
     }
 }

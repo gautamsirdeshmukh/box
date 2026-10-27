@@ -17,6 +17,7 @@ path = "src/lib.rs"
 # (rustls + ring for the ephemeral CA); the socket-free Part B never touches them.
 default = ["tls-intercept"]
 tls-intercept = [
+    "dep:libc",
     "dep:rustls",
     "dep:rustls-pki-types",
     "dep:webpki-roots",
@@ -25,6 +26,7 @@ tls-intercept = [
 ]
 
 [dependencies]
+libc = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"] }
 # The credential vault (mint half). This is the ONE-WAY dependency the mint/inject
 # split rests on: the proxy *injects* the secret, `credentials` *mints* it

@@ -1,9 +1,8 @@
 //! [`MitmHandle`] — the supervisor's control surface for a running adapter.
 
-use std::os::unix::net::UnixStream;
+use super::listener::AcceptControl;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use crate::audit::{NetworkAuditEvent, SharedAuditLog};
@@ -32,7 +31,7 @@ pub struct MitmHandle {
     ssl_cert_file: Option<PathBuf>,
     credential_env: Vec<CredentialEnv>,
     audit: SharedAuditLog,
-    stop: Arc<AtomicBool>,
+    control: Arc<AcceptControl>,
     accept_thread: Option<JoinHandle<()>>,
 }
 
@@ -44,7 +43,7 @@ impl MitmHandle {
         ssl_cert_file: Option<PathBuf>,
         credential_env: Vec<CredentialEnv>,
         audit: SharedAuditLog,
-        stop: Arc<AtomicBool>,
+        control: Arc<AcceptControl>,
         accept_thread: JoinHandle<()>,
     ) -> Self {
         Self {
@@ -53,7 +52,7 @@ impl MitmHandle {
             ssl_cert_file,
             credential_env,
             audit,
-            stop,
+            control,
             accept_thread: Some(accept_thread),
         }
     }
@@ -114,22 +113,10 @@ impl MitmHandle {
         self.audit.drain()
     }
 
-    /// Shut the adapter down: flip the stop flag and unblock the accept loop by poking the
-    /// listener. Idempotent — a second call (or `Drop`) is a no-op.
+    /// Request cancellation of connection admission, including any wait for capacity.
+    /// Idempotent: a second call (or `Drop`) is a no-op.
     pub fn shutdown(&self) {
-        if self.stop.swap(true, Ordering::SeqCst) {
-            return; // already shutting down
-        }
-        // Unblock the blocking `accept()` by opening (and dropping) a throwaway connection over the
-        // same transport the accept loop is waiting on.
-        match &self.transport {
-            BoundTransport::Tcp(port) => {
-                let _ = std::net::TcpStream::connect(("127.0.0.1", *port));
-            }
-            BoundTransport::Unix(path) => {
-                let _ = UnixStream::connect(path);
-            }
-        }
+        self.control.shutdown();
     }
 }
 
@@ -148,7 +135,7 @@ mod tests {
     use std::collections::HashMap;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -163,61 +150,46 @@ mod tests {
         std::env::temp_dir().join(format!("slc-{}-{n}.sock", std::process::id()))
     }
 
-    /// Mirror `listener::accept_loop`'s stop-poll + blocking-accept shape: block in `accept()` and only
-    /// recheck `stop` when a connection wakes the loop. This is exactly the structure `shutdown()` must
-    /// unblock, so the drop-does-not-hang test exercises the real regression rather than a stand-in.
+    /// Use the production admission wait so the drop-does-not-hang test exercises
+    /// the real shutdown path rather than a stand-in.
     fn unix_handle() -> (MitmHandle, PathBuf) {
         let path = unique_sock_path();
         // A stale socket file from a crashed prior run would fail bind; clear it first (best-effort).
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let accept_thread = {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                for incoming in listener.incoming() {
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    drop(incoming);
-                }
-            })
-        };
+        listener.set_nonblocking(true).unwrap();
+        let (control, wakeup) = AcceptControl::new(1).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            super::super::listener::next_stream(&listener, &wakeup, || listener.accept()).unwrap();
+        });
         let handle = MitmHandle::new(
             BoundTransport::Unix(path.clone()),
             None,
             None,
             Vec::new(),
             SharedAuditLog::new(),
-            stop,
+            control,
             accept_thread,
         );
         (handle, path)
     }
 
-    /// A TCP-transport handle whose accept thread mirrors the same stop-poll shape.
+    /// A TCP handle with the production admission wait.
     fn tcp_handle() -> MitmHandle {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let stop = Arc::new(AtomicBool::new(false));
-        let accept_thread = {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                for incoming in listener.incoming() {
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    drop(incoming);
-                }
-            })
-        };
+        listener.set_nonblocking(true).unwrap();
+        let (control, wakeup) = AcceptControl::new(1).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            super::super::listener::next_stream(&listener, &wakeup, || listener.accept()).unwrap();
+        });
         MitmHandle::new(
             BoundTransport::Tcp(port),
             None,
             None,
             Vec::new(),
             SharedAuditLog::new(),
-            stop,
+            control,
             accept_thread,
         )
     }
@@ -259,15 +231,14 @@ mod tests {
         }
     }
 
-    /// `Drop` (via `shutdown()`) must
-    /// unblock the AF_UNIX accept loop over `UnixStream`, not the old `TcpStream::connect` that would
-    /// never wake it. Bounded so a regression fails this test rather than hanging the whole suite.
+    /// `Drop` (via `shutdown()`) must unblock the AF_UNIX accept loop.
+    /// Bounded so a regression fails this test rather than hanging the whole suite.
     #[test]
     fn drop_does_not_hang_under_af_unix() {
         let (handle, _path) = unix_handle();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            drop(handle); // shutdown() self-connects over UnixStream, unblocking accept()
+            drop(handle); // shutdown() closes the private wakeup, unblocking admission.
             let _ = tx.send(());
         });
         assert!(

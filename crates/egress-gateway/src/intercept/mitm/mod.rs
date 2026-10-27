@@ -15,7 +15,6 @@ mod tls;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::ClientConfig;
@@ -265,7 +264,8 @@ impl MitmInterceptor {
             expected_token,
         });
 
-        let stop = Arc::new(AtomicBool::new(false));
+        let (control, wakeup) = listener::AcceptControl::new(config.max_connections)
+            .map_err(|e| ProxyError::Bind(format!("creating listener wakeup: {e}")))?;
 
         // Bind exactly one transport. `unix_socket_path: Some(path)` binds ONLY an AF_UNIX
         // socket — no `TcpListener` is created in that mode — since a workload contained by the
@@ -280,10 +280,15 @@ impl MitmInterceptor {
                     .local_addr()
                     .map_err(|e| ProxyError::Bind(format!("reading bound addr: {e}")))?
                     .port();
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|e| ProxyError::Bind(format!("setting listener nonblocking: {e}")))?;
                 let accept_thread = {
                     let state = state.clone();
-                    let stop = stop.clone();
-                    std::thread::spawn(move || listener::accept_loop(listener, state, stop))
+                    let control = control.clone();
+                    std::thread::spawn(move || {
+                        listener::accept_loop(listener, state, control, wakeup)
+                    })
                 };
                 (BoundTransport::Tcp(port), accept_thread)
             }
@@ -307,10 +312,15 @@ impl MitmInterceptor {
                         ))
                     },
                 )?;
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|e| ProxyError::Bind(format!("setting listener nonblocking: {e}")))?;
                 let accept_thread = {
                     let state = state.clone();
-                    let stop = stop.clone();
-                    std::thread::spawn(move || listener::accept_loop_unix(listener, state, stop))
+                    let control = control.clone();
+                    std::thread::spawn(move || {
+                        listener::accept_loop_unix(listener, state, control, wakeup)
+                    })
                 };
                 (BoundTransport::Unix(path.clone()), accept_thread)
             }
@@ -322,7 +332,7 @@ impl MitmInterceptor {
             ssl_cert_file,
             credential_env,
             audit,
-            stop,
+            control,
             accept_thread,
         ))
     }

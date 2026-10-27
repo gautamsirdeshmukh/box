@@ -1568,6 +1568,16 @@ separable from the feature, because a virtual environment is exactly that shape.
 
 ## Egress
 
+<a id="gateway-shutdown-has-a-private-wakeup"></a>
+### Gateway shutdown has a private wakeup
+
+The gateway creates a private socket pair before it starts the accept thread.
+Shutdown closes the writer to wake the listener and notifies any wait for connection capacity.
+A connection to the public listener can fail or remain unfinished, so it cannot reliably wake shutdown.
+The private channel needs two file descriptors while the gateway runs, but it needs no new descriptor or address lookup during shutdown.
+Dropping the handle waits for the accept thread, while accepted connection handlers finish independently.
+`shutdown_does_not_need_the_bound_unix_path` pins independence from the bound address.
+
 <a id="plain-http-takes-the-same-governed-path-as-https"></a>
 ### The gateway forwards plain HTTP through the same governed path as HTTPS
 
