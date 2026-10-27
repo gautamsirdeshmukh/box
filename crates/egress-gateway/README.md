@@ -227,10 +227,9 @@ workload; `box.toml` exposes no key for it.
 `env_vars()` returns the four `HTTP_PROXY`/`HTTPS_PROXY` spellings on the TCP
 transport and no proxy variable on AF_UNIX. It adds `SSL_CERT_FILE` on both
 transports when a CA directory is configured. `Drop` shuts the adapter down and
-joins the accept thread. `shutdown()` requests cancellation without waiting for
-the accept thread. It wakes both the socket wait and a wait for connection
-capacity. The private shutdown channel does not depend on the bound address
-remaining reachable. Accepted connection handlers finish independently.
+joins the accept thread. A successful wakeup connection stays open until the
+accept thread exits. A failed wakeup connection or an exhausted connection limit
+can still block shutdown.
 
 ## Errors
 

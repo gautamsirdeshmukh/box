@@ -1,8 +1,10 @@
 //! [`MitmHandle`] — the supervisor's control surface for a running adapter.
 
-use super::listener::AcceptControl;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use crate::audit::{NetworkAuditEvent, SharedAuditLog};
@@ -31,8 +33,9 @@ pub struct MitmHandle {
     ssl_cert_file: Option<PathBuf>,
     credential_env: Vec<CredentialEnv>,
     audit: SharedAuditLog,
-    control: Arc<AcceptControl>,
+    stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
+    shutdown_connection: OnceLock<OwnedFd>,
 }
 
 impl MitmHandle {
@@ -43,7 +46,7 @@ impl MitmHandle {
         ssl_cert_file: Option<PathBuf>,
         credential_env: Vec<CredentialEnv>,
         audit: SharedAuditLog,
-        control: Arc<AcceptControl>,
+        stop: Arc<AtomicBool>,
         accept_thread: JoinHandle<()>,
     ) -> Self {
         Self {
@@ -52,8 +55,9 @@ impl MitmHandle {
             ssl_cert_file,
             credential_env,
             audit,
-            control,
+            stop,
             accept_thread: Some(accept_thread),
+            shutdown_connection: OnceLock::new(),
         }
     }
 
@@ -113,10 +117,23 @@ impl MitmHandle {
         self.audit.drain()
     }
 
-    /// Request cancellation of connection admission, including any wait for capacity.
-    /// Idempotent: a second call (or `Drop`) is a no-op.
+    /// Shut the adapter down: flip the stop flag and unblock the accept loop by poking the
+    /// listener. Idempotent — a second call (or `Drop`) is a no-op.
     pub fn shutdown(&self) {
-        self.control.shutdown();
+        if self.stop.swap(true, Ordering::SeqCst) {
+            return; // already shutting down
+        }
+        // Unblock the blocking `accept()` by opening (and dropping) a throwaway connection over the
+        // same transport the accept loop is waiting on.
+        let connection = match &self.transport {
+            BoundTransport::Tcp(port) => {
+                std::net::TcpStream::connect(("127.0.0.1", *port)).map(OwnedFd::from)
+            }
+            BoundTransport::Unix(path) => UnixStream::connect(path).map(OwnedFd::from),
+        };
+        if let Ok(connection) = connection {
+            let _ = self.shutdown_connection.set(connection);
+        }
     }
 }
 
@@ -135,7 +152,7 @@ mod tests {
     use std::collections::HashMap;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::AtomicU32;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -150,46 +167,61 @@ mod tests {
         std::env::temp_dir().join(format!("slc-{}-{n}.sock", std::process::id()))
     }
 
-    /// Use the production admission wait so the drop-does-not-hang test exercises
-    /// the real shutdown path rather than a stand-in.
+    /// Mirror `listener::accept_loop`'s stop-poll + blocking-accept shape: block in `accept()` and only
+    /// recheck `stop` when a connection wakes the loop. This is exactly the structure `shutdown()` must
+    /// unblock, so the drop-does-not-hang test exercises the real regression rather than a stand-in.
     fn unix_handle() -> (MitmHandle, PathBuf) {
         let path = unique_sock_path();
         // A stale socket file from a crashed prior run would fail bind; clear it first (best-effort).
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (control, wakeup) = AcceptControl::new(1).unwrap();
-        let accept_thread = std::thread::spawn(move || {
-            super::super::listener::next_stream(&listener, &wakeup, || listener.accept()).unwrap();
-        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept_thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    drop(incoming);
+                }
+            })
+        };
         let handle = MitmHandle::new(
             BoundTransport::Unix(path.clone()),
             None,
             None,
             Vec::new(),
             SharedAuditLog::new(),
-            control,
+            stop,
             accept_thread,
         );
         (handle, path)
     }
 
-    /// A TCP handle with the production admission wait.
+    /// A TCP-transport handle whose accept thread mirrors the same stop-poll shape.
     fn tcp_handle() -> MitmHandle {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
-        let (control, wakeup) = AcceptControl::new(1).unwrap();
-        let accept_thread = std::thread::spawn(move || {
-            super::super::listener::next_stream(&listener, &wakeup, || listener.accept()).unwrap();
-        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept_thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    drop(incoming);
+                }
+            })
+        };
         MitmHandle::new(
             BoundTransport::Tcp(port),
             None,
             None,
             Vec::new(),
             SharedAuditLog::new(),
-            control,
+            stop,
             accept_thread,
         )
     }
@@ -231,19 +263,55 @@ mod tests {
         }
     }
 
-    /// `Drop` (via `shutdown()`) must unblock the AF_UNIX accept loop.
-    /// Bounded so a regression fails this test rather than hanging the whole suite.
+    /// `Drop` (via `shutdown()`) must
+    /// unblock the AF_UNIX accept loop over `UnixStream`, not the old `TcpStream::connect` that would
+    /// never wake it. Bounded so a regression fails this test rather than hanging the whole suite.
     #[test]
     fn drop_does_not_hang_under_af_unix() {
         let (handle, _path) = unix_handle();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            drop(handle); // shutdown() closes the private wakeup, unblocking admission.
+            drop(handle); // shutdown() self-connects over UnixStream, unblocking accept()
             let _ = tx.send(());
         });
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "MitmHandle::drop() must not hang under the AF_UNIX-only pin (a regression)"
         );
+    }
+
+    #[test]
+    fn shutdown_connection_lives_until_accept_thread_exits() {
+        use std::io::{ErrorKind, Read};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted, received) = mpsc::channel();
+        let (finish, released) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            accepted.send(listener.accept().unwrap().0).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle = MitmHandle::new(
+            BoundTransport::Tcp(port),
+            None,
+            None,
+            Vec::new(),
+            SharedAuditLog::new(),
+            Arc::new(AtomicBool::new(false)),
+            thread,
+        );
+        handle.shutdown();
+        let mut peer = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let before_join = peer.read(&mut [0]);
+        finish.send(()).unwrap();
+        drop(handle);
+        assert!(
+            matches!(before_join, Err(ref error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "shutdown closed its connection before the accept thread exited: {before_join:?}"
+        );
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
 }
