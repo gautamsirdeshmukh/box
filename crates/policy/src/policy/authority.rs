@@ -11,9 +11,9 @@ use super::{Policy, SchemaStage, authored};
 use crate::check::{Finding, Refused, RuleRef, annotated_id};
 use crate::dogwood::{
     DogwoodEngine, check_canonical_policy_set, check_policy_source, parse_policy_source,
-    validate_canonical_policy_set,
+    policy_is_tool_scoped, validate_canonical_policy_set,
 };
-use crate::schema::{ActionIdentity, GovernedBox};
+use crate::schema::{ActionIdentity, GovernedBox, mcp_action_namespace};
 use crate::spelling::{Operator, PolicyWarning};
 use crate::{Decision, Outcome, PolicyError, PolicyStagingError, Principal, Request};
 
@@ -30,6 +30,7 @@ struct ProposalState {
     schemas: BTreeMap<String, String>,
     ready: BTreeSet<usize>,
     pending: BTreeMap<usize, String>,
+    discovery_finished: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +130,7 @@ impl Authority {
             schemas: BTreeMap::new(),
             ready: BTreeSet::new(),
             pending: BTreeMap::new(),
+            discovery_finished: false,
         };
         let complete = proposal.complete_policy_set();
         let (readiness, pending_tools, warnings) =
@@ -191,14 +193,9 @@ impl Authority {
     /// Re-install an authored policy set over the live engine, keeping this box's decision
     /// history and the MCP schemas this run already discovered.
     ///
-    /// Validation runs before the live lock is taken, so text that does not validate costs no
-    /// decision latency and leaves the previous authority serving every request. The authored
-    /// set is replaced wholesale and refused wholesale: `open_staged` may install the
-    /// schema-independent subset and open `Discovering`, because at startup the typed schemas
-    /// have not arrived yet and a box that denied everything until they did would be useless.
-    /// A reload has no such excuse — the schemas are already here, so a set that cannot
-    /// validate is an operator error, and installing the part of it that happens to validate
-    /// would report success for a rule that is not live.
+    /// Validation precedes installation; a refused replacement leaves the current policy in place.
+    /// During discovery, rules awaiting tool definitions stay pending and their tools stay blocked.
+    /// After discovery, the complete replacement must validate.
     pub(super) fn reload(&self, sources: &[Policy]) -> Result<(), PolicyStagingError> {
         // Same order as `stage_mcp_schema`: proposal first, then live. A reload that took them
         // the other way round would deadlock against a schema staging mid-discovery.
@@ -226,18 +223,56 @@ impl Authority {
 
         let schemas = proposed.schema_sources();
         let complete = proposed.complete_policy_set();
-        let (effective_schema, _) =
-            validate_canonical_policy_set(&complete, &schemas, &proposed.operator, &[])?;
+        let (installed, effective_schema) =
+            match validate_canonical_policy_set(&complete, &schemas, &proposed.operator, &[]) {
+                Ok((schema, _)) => {
+                    proposed.mark_all_ready();
+                    (complete, schema)
+                }
+                Err(error) => {
+                    if proposed.discovery_finished || is_inert(&error) {
+                        return Err(error.into());
+                    }
+                    proposed.classify(&schemas)?;
+                    for ordinal in proposed.pending.keys() {
+                        let source = &proposed.candidates[*ordinal].expanded_source;
+                        if !policy_is_tool_scoped(source)? {
+                            return Err(error.into());
+                        }
+                        let mut actions = BTreeSet::new();
+                        collect_typed_actions(source, &mut actions);
+                        if actions.iter().all(|(namespace, _)| {
+                            proposed
+                                .schemas
+                                .keys()
+                                .any(|server| mcp_action_namespace(server) == *namespace)
+                        }) {
+                            return Err(error.into());
+                        }
+                    }
+                    let subset = proposed.ready_policy_set();
+                    let (schema, _) = validate_canonical_policy_set(
+                        &subset,
+                        &schemas,
+                        &proposed.operator,
+                        &proposed.ready_positions(),
+                    )?;
+                    (subset, schema)
+                }
+            };
 
         let mut live = self.live.lock().map_err(|_| {
             PolicyStagingError::Durable("policy authority lock poisoned".to_string())
         })?;
         live.engine
-            .commit_staged(&complete, effective_schema)
+            .commit_staged(&installed, effective_schema)
             .map_err(|error| PolicyStagingError::Durable(error.to_string()))?;
-        proposed.mark_all_ready();
-        live.readiness = Readiness::Ready;
-        live.pending_tools = BTreeSet::new();
+        live.readiness = if proposed.pending.is_empty() {
+            Readiness::Ready
+        } else {
+            Readiness::Discovering
+        };
+        live.pending_tools = pending_typed_tools(&proposed);
         drop(live);
         *proposal_guard = Some(proposed);
         Ok(())
@@ -345,13 +380,16 @@ impl Authority {
     /// schema-independent subset becomes the final `Ready` authority, and the degraded server
     /// namespaces are returned so the caller can warn. Only a genuine durable fault is an `Err`.
     pub(super) fn finish_mcp_discovery(&self) -> Result<Vec<String>, PolicyStagingError> {
-        let proposal = self
+        let mut proposal = self
             .proposal
             .lock()
             .map_err(|_| PolicyStagingError::Durable("policy staging lock poisoned".to_string()))?;
         let mut live = self.live.lock().map_err(|_| {
             PolicyStagingError::Durable("policy authority lock poisoned".to_string())
         })?;
+        if let Some(proposal) = proposal.as_mut() {
+            proposal.discovery_finished = true;
+        }
         if live.readiness == Readiness::Ready {
             return Ok(Vec::new());
         }
@@ -731,6 +769,7 @@ pub(super) fn check_staged(
         schemas: BTreeMap::new(),
         ready: BTreeSet::new(),
         pending: BTreeMap::new(),
+        discovery_finished: false,
     };
     let unlocated = |findings: Vec<Finding>| -> Vec<Finding> {
         findings.into_iter().map(Finding::without_span).collect()
@@ -905,6 +944,7 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
             error,
             PolicyStagingError::Durable(ref reason) if reason.contains("staging lock poisoned")
         ));
+        assert!(authority.reload(&staged_source()).is_err());
     }
 
     #[test]
@@ -925,6 +965,7 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
             error,
             PolicyStagingError::Durable(ref reason) if reason.contains("authority lock poisoned")
         ));
+        assert!(authority.reload(&staged_source()).is_err());
     }
 
     #[test]
@@ -1338,6 +1379,100 @@ when temporal {
             decide(&authority, &alpha_tool_call(&in_bounds)).is_allow(),
             "once staged, the typed rule enforces and the call is allowed"
         );
+    }
+
+    #[test]
+    fn reload_during_discovery_keeps_the_latest_rules_and_pending_tools() {
+        let history = tempfile::tempdir().expect("history directory");
+        let authority = Authority::open_staged(
+            &Operator::unanchored(),
+            discovering_source(),
+            &history.path().join("dogwood.redb"),
+        )
+        .unwrap();
+        let mut restricted = discovering_source();
+        restricted[0]
+            .text
+            .push_str("\nforbid(principal, action == Box::Action::\"shell:exec\", resource);");
+        for replacement in [
+            discovering_source(),
+            source("permit(principal, action, resource);"),
+            Vec::new(),
+            restricted,
+        ] {
+            authority.reload(&replacement).unwrap();
+        }
+        assert!(!decide(&authority, &shell_request()).is_allow());
+        let arguments = serde_json::json!({ "path": "x" });
+        assert!(matches!(
+            decide(&authority, &alpha_tool_call(&arguments)),
+            Decision::Deny {
+                reason: DenyReason::PolicyPending,
+                ..
+            }
+        ));
+        assert_eq!(
+            authority
+                .stage_mcp_schema("alpha", generated("alpha", "read", "path"))
+                .unwrap(),
+            SchemaStage::Accepted {
+                authority_ready: true,
+            }
+        );
+        assert!(decide(&authority, &alpha_tool_call(&arguments)).is_allow());
+        assert!(!decide(&authority, &shell_request()).is_allow());
+    }
+
+    #[test]
+    fn reload_during_discovery_rejects_invalid_rules_with_known_definitions() {
+        let history = tempfile::tempdir().expect("history directory");
+        let mut initial = discovering_source();
+        initial[0]
+            .text
+            .push_str("\nforbid(principal, action == Box::Action::\"shell:exec\", resource);");
+        let authority = Authority::open_staged(
+            &Operator::unanchored(),
+            initial,
+            &history.path().join("dogwood.redb"),
+        )
+        .unwrap();
+        authority
+            .stage_mcp_schema("beta", generated("beta", "read", "path"))
+            .unwrap();
+        for invalid in [
+            "this is not a policy",
+            r#"permit(principal, action == Box::Action::"not:declared", resource);"#,
+            r#"permit(principal, action == beta::Action::"read", resource)
+               when { context.input.missing == "x" };"#,
+            r#"forbid(principal,
+               action in [Box::Action::"shell:exec", alpha::Action::"read"], resource);"#,
+            r#"forbid(principal, action, resource)
+               when { action != alpha::Action::"read" };"#,
+        ] {
+            let mut replacement = discovering_source();
+            replacement.extend(source(invalid));
+            assert!(authority.reload(&replacement).is_err());
+            assert!(!decide(&authority, &shell_request()).is_allow());
+        }
+    }
+
+    #[test]
+    fn reload_after_discovery_does_not_wait_for_missing_definitions() {
+        for initial in [
+            discovering_source(),
+            source("permit(principal, action, resource);"),
+        ] {
+            let history = tempfile::tempdir().expect("history directory");
+            let authority = Authority::open_staged(
+                &Operator::unanchored(),
+                initial,
+                &history.path().join("dogwood.redb"),
+            )
+            .unwrap();
+            authority.finish_mcp_discovery().unwrap();
+            assert!(authority.reload(&discovering_source()).is_err());
+            assert!(decide(&authority, &shell_request()).is_allow());
+        }
     }
 
     /// A `tools/list` forbid for a server that also has a typed rule LOADS (no refusal). The

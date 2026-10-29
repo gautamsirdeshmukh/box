@@ -47,18 +47,28 @@ use crate::run::credential;
 use crate::run::lock::{BoxLive, Lock};
 use crate::run::telemetry;
 
-static RUNNING_POLICY: Mutex<Option<Arc<PolicyEngine>>> = Mutex::new(None);
+static RUNNING_POLICY: Mutex<Option<(Arc<PolicyEngine>, Arc<telemetry::Collector>)>> =
+    Mutex::new(None);
 
 pub(crate) fn reload(sources: &[policy::Policy]) -> Result<(), BoxError> {
     let running = RUNNING_POLICY
         .lock()
-        .map_err(|error| DaemonError::Refused {
-            reason: error.to_string(),
-        })?;
-    let policy = running.as_ref().ok_or_else(|| DaemonError::Refused {
-        reason: "no box is running in this process".into(),
-    })?;
-    policy.reload(sources).map_err(BoxError::from)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (policy, collector) = running.as_ref().ok_or(DaemonError::NotRunning)?;
+    let result = policy.reload(sources).map_err(BoxError::from);
+    let subject = telemetry::policy_subject(sources);
+    collector.control(match &result {
+        Ok(()) => telemetry::ControlRecord::completed(
+            telemetry::ControlOperation::PolicyInstalled,
+            &subject,
+        ),
+        Err(error) => telemetry::ControlRecord::refused(
+            telemetry::ControlOperation::PolicyRefused,
+            &subject,
+            &error.to_string(),
+        ),
+    });
+    result
 }
 
 /// What the workload's boundary needs from the box hosting it.
@@ -768,7 +778,7 @@ impl HostedBox {
         let published = PublishedRecord(root.clone());
         *RUNNING_POLICY
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(policy);
+            .unwrap_or_else(|error| error.into_inner()) = Some((policy, Arc::clone(&collector)));
         Ok(Self {
             discovery: Some(discovery),
             broker: Some(broker),

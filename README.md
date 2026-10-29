@@ -103,6 +103,10 @@ strands_box::reload(&[strands_box::Policy {
 `reload` waits until the change takes effect. Invalid policy returns `BoxError` and leaves
 the current policy in place. An empty list denies all policy requests. Policy files and the
 OS sandbox stay unchanged. A box must be open; `on_ready` runs too early.
+During MCP discovery, rules awaiting tool definitions stay pending and their tools stay blocked.
+Reload refuses an unresolved rule that also applies to non-tool actions.
+After discovery, the complete replacement must validate. Reloads and refusals are recorded
+alongside the box's other policy events.
 
 To generate policy schemas:
 

@@ -274,6 +274,48 @@ mod reload_tests {
             "library reload probe failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let records =
+            std::fs::read_to_string(configured.root().join("private/telemetry/records.jsonl"))
+                .unwrap();
+        let mut reloads = Vec::new();
+        for line in records.lines() {
+            let batch: serde_json::Value = serde_json::from_str(line).unwrap();
+            for resource in batch["resourceLogs"].as_array().into_iter().flatten() {
+                for scope in resource["scopeLogs"].as_array().into_iter().flatten() {
+                    if scope["scope"]["name"] != "strands-box.control" {
+                        continue;
+                    }
+                    for record in scope["logRecords"].as_array().into_iter().flatten() {
+                        let read = |key: &str| {
+                            record["attributes"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|attribute| attribute["key"] == key)
+                                .unwrap()["value"]["stringValue"]
+                                .as_str()
+                                .unwrap()
+                        };
+                        let subject = read("strands.box.control.subject");
+                        if matches!(subject, "library-policy.dw" | "<no authored policy>") {
+                            let operation = read("strands.box.control.operation");
+                            let outcome = read("strands.box.control.outcome");
+                            reloads.push(format!("{operation} {outcome} {subject}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            reloads,
+            [
+                "policy_installed ok library-policy.dw",
+                "policy_refused refused library-policy.dw",
+                "policy_refused refused library-policy.dw",
+                "policy_installed ok library-policy.dw",
+                "policy_installed ok <no authored policy>",
+            ]
+        );
     }
 
     fn sources(text: &str) -> [strands_box::Policy; 1] {
@@ -286,7 +328,7 @@ mod reload_tests {
     pub(super) fn assert_not_running() {
         assert_eq!(
             strands_box::reload(&[]).unwrap_err().to_string(),
-            "the trusted Box operation refused: no box is running in this process"
+            "no box is running in this process"
         );
     }
 

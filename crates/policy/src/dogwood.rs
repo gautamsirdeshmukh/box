@@ -536,6 +536,25 @@ pub(crate) fn check_policy_source(source: &str) -> Result<Vec<String>, Refused> 
         .collect())
 }
 
+/// Whether every action in a rule's scope is a typed MCP action.
+pub(crate) fn policy_is_tool_scoped(source: &str) -> Result<bool, PolicyError> {
+    use dogwood_language::ActionConstraint;
+
+    let parsed = dogwood_language::ParsedPolicySet::parse(source, &service_schema()?)
+        .map_err(|error| parse_refused(source, &error, false).into_error())?;
+    let is_tool = |uid: &cedar_policy::EntityUid| {
+        let kind = uid.type_name().to_string();
+        kind.ends_with("::Action") && kind != "Box::Action"
+    };
+    Ok(parsed
+        .policies()
+        .all(|policy| match policy.scope().action() {
+            ActionConstraint::Any => false,
+            ActionConstraint::Eq(uid) => is_tool(uid),
+            ActionConstraint::In(uids) => !uids.is_empty() && uids.iter().all(is_tool),
+        }))
+}
+
 /// Strict-validate canonical policy statements against an ordered schema set.
 ///
 /// `positions` holds the authored index of each statement, and an empty slice means the statements
