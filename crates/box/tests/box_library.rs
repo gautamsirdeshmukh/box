@@ -1,4 +1,4 @@
-//! Process protections, policy reload, and repeat-run refusal through the library.
+//! Process protections, policy reload, and repeat-run refusal through the public library entry point.
 
 #[cfg(unix)]
 #[path = "support/bounded_output.rs"]
