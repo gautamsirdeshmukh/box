@@ -100,12 +100,9 @@ strands_box::reload(&[strands_box::Policy {
 }])?;
 ```
 
-`reload` replaces the current policy and waits until the change takes effect. It returns
-`BoxError` if validation fails or no box is open. Invalid policy leaves the current policy
-unchanged; an empty list denies all policy requests.
-It uses the supplied text without reading or changing policy files. The workload and OS
-sandbox stay in place.
-Call it after the box opens; `on_ready` runs too early.
+`reload` waits until the change takes effect. Invalid policy returns `BoxError` and leaves
+the current policy in place. An empty list denies all policy requests. Policy files and the
+OS sandbox stay unchanged. A box must be open; `on_ready` runs too early.
 
 To generate policy schemas:
 

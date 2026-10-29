@@ -268,10 +268,6 @@ mod reload_tests {
             .arg(configured.box_home())
             .env("HOME", configured.operator_home())
             .env("EXPERIMENTAL_LINUX_SUPPORT", "TRUE");
-        assert_success(command);
-    }
-
-    fn assert_success(command: Command) {
         let output = bounded_output::bounded_output(command);
         assert!(
             output.status.success(),
@@ -289,9 +285,7 @@ mod reload_tests {
 
     pub(super) fn assert_not_running() {
         assert_eq!(
-            strands_box::reload(&sources(ALLOW))
-                .unwrap_err()
-                .to_string(),
+            strands_box::reload(&[]).unwrap_err().to_string(),
             "no box is running in this process"
         );
     }
@@ -299,23 +293,21 @@ mod reload_tests {
     fn running_box(config: &Path, home: &Path) {
         assert_not_running();
         let original = std::fs::read(config.with_file_name("policy.dw")).unwrap();
-        std::thread::scope(|scope| {
-            let mut controller = None;
-            let code = strands_box::run(
+        let code = std::thread::scope(|scope| {
+            strands_box::run(
                 config.into(),
                 vec!["--reload-workload".into()],
                 strands_box::RunOptions {
                     on_ready: Some(Box::new(|| {
                         assert_not_running();
-                        controller = Some(scope.spawn(|| change_policy(home)));
+                        scope.spawn(|| change_policy(home));
                         Ok(())
                     })),
                     ..Default::default()
                 },
-            );
-            controller.unwrap().join().unwrap();
-            assert_eq!(code, ExitCode::SUCCESS);
+            )
         });
+        assert_eq!(code, ExitCode::SUCCESS);
         assert_not_running();
         assert_eq!(
             std::fs::read(config.with_file_name("policy.dw")).unwrap(),
@@ -325,16 +317,8 @@ mod reload_tests {
     }
 
     fn change_policy(home: &Path) {
-        wait_until(|| home.join("ready").exists());
-        wait_until(|| match strands_box::reload(&sources(RESTRICTED)) {
-            Ok(()) => true,
-            Err(error) => {
-                assert_eq!(error.to_string(), "no box is running in this process");
-                false
-            }
-        });
-        let mut workload_id = None;
-        for (step, allowed) in [false, true, true, false, false].into_iter().enumerate() {
+        wait_for(&home.join("ready"));
+        for step in 0..5 {
             match step {
                 1 => strands_box::reload(&sources(ALLOW)).unwrap(),
                 2 => {
@@ -350,20 +334,7 @@ mod reload_tests {
                 _ => {}
             }
             std::fs::write(home.join(format!("request-{step}")), "").unwrap();
-            let response = home.join(format!("response-{step}"));
-            wait_until(|| response.exists());
-            let (id, success, stdout, stderr): (u32, bool, String, String) =
-                serde_json::from_slice(&std::fs::read(response).unwrap()).unwrap();
-            assert_eq!(*workload_id.get_or_insert(id), id);
-            assert_eq!(success, allowed, "step {step}: {stdout}\n{stderr}");
-            if allowed {
-                assert_eq!(stdout, "reload-target\n");
-            } else {
-                assert!(
-                    stderr.contains("policy denied") || stderr.contains("default-deny"),
-                    "step {step} must fail at policy: {stderr}"
-                );
-            }
+            wait_for(&home.join(format!("response-{step}")));
         }
     }
 
@@ -372,29 +343,30 @@ mod reload_tests {
         let home = Path::new(&home);
         assert_not_running();
         std::fs::write(home.join("ready"), "").unwrap();
-        for step in 0..5 {
-            wait_until(|| home.join(format!("request-{step}")).exists());
+        for (step, allowed) in [false, true, true, false, false].into_iter().enumerate() {
+            wait_for(&home.join(format!("request-{step}")));
             let output = Command::new("bash")
                 .args(["-c", "cat target.txt"])
                 .output()
                 .unwrap();
-            let response = serde_json::to_vec(&(
-                std::process::id(),
-                output.status.success(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            ))
-            .unwrap();
-            let staged = home.join("response-staged");
-            std::fs::write(&staged, response).unwrap();
-            std::fs::rename(staged, home.join(format!("response-{step}"))).unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), allowed, "step {step}: {stderr}");
+            if allowed {
+                assert_eq!(output.stdout, b"reload-target\n");
+            } else {
+                assert!(
+                    stderr.contains("policy denied") || stderr.contains("default-deny"),
+                    "step {step} must fail at policy: {stderr}"
+                );
+            }
+            std::fs::write(home.join(format!("response-{step}")), "").unwrap();
         }
     }
 
-    fn wait_until(mut ready: impl FnMut() -> bool) {
+    fn wait_for(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !ready() {
-            assert!(Instant::now() < deadline, "library reload probe timed out");
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
