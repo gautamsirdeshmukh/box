@@ -23,7 +23,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use egress_gateway::{
     CapabilitySet, CredentialCapability, MitmConfig, MitmHandle, MitmInterceptor,
@@ -32,7 +32,7 @@ use policy::{
     EgressPolicyInterceptor, GovernedBox, McpServerKind, PolicyEngine, Principal, ToolCatalogs,
 };
 
-use crate::error::{BoxError, ConfigError, DaemonError};
+use crate::error::{BoxError, ConfigError, DaemonError, Internal};
 use crate::record::config::process::ProcessSpec;
 use crate::record::config::{AuthoritySource, Record};
 use crate::record::layout::BoxRoot;
@@ -46,6 +46,16 @@ use crate::run::contain::boundary::{
 use crate::run::credential;
 use crate::run::lock::{BoxLive, Lock};
 use crate::run::telemetry;
+
+static RUNNING_POLICY: Mutex<Option<Arc<PolicyEngine>>> = Mutex::new(None);
+
+pub(crate) fn reload(sources: &[policy::Policy]) -> Result<(), BoxError> {
+    let running = RUNNING_POLICY
+        .lock()
+        .map_err(|_| Internal::ReloadUnavailable)?;
+    let policy = running.as_ref().ok_or(Internal::NoRunningBox)?;
+    policy.reload(sources).map_err(BoxError::from)
+}
 
 /// What the workload's boundary needs from the box hosting it.
 #[derive(Debug, Clone)]
@@ -752,6 +762,9 @@ impl HostedBox {
         )?;
         BoxLive::publish(root, proxy_port)?;
         let published = PublishedRecord(root.clone());
+        *RUNNING_POLICY
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(policy);
         Ok(Self {
             discovery: Some(discovery),
             broker: Some(broker),
@@ -826,6 +839,9 @@ impl HostedBox {
 
 impl Drop for HostedBox {
     fn drop(&mut self) {
+        *RUNNING_POLICY
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         if let Some(discovery) = &self.discovery {
             discovery.close();
         }
@@ -1448,7 +1464,7 @@ while :; do :; done"#
             )
         })
         .expect("the workload boundary translates");
-        let mut contained =
+        let contained =
             crate::run::contain::supervise::Contained::testing_spawn_uncontained(boundary, hosted)
                 .await
                 .expect("the supervised workload starts");
@@ -1469,15 +1485,6 @@ while :; do :; done"#
             .await
             .expect("the fatal staging failure stops the supervised workload")
             .expect_err("the run must report the durable staging failure");
-        assert!(
-            BoxLive::read(&root).is_some(),
-            "waiting retains live state until its owner is dropped"
-        );
-        assert!(
-            Lock::is_held(&root.lock()).expect("the retained lock state reads"),
-            "waiting retains the box lock so pending reloads can finish"
-        );
-        drop(contained);
         assert!(
             failure
                 .to_string()
@@ -1594,7 +1601,7 @@ while :; do :; done"#
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_normal_exit_ends_the_descendants_the_leader_left_behind() {
-        let mut workload = supervised_workload(
+        let workload = supervised_workload(
             r#"trap '' TERM; sleep 3600 & printf '%s %s' "$$" "$!" > "$1"; exit 0"#,
             2,
         )
@@ -1608,7 +1615,6 @@ while :; do :; done"#
         .await
         .expect("the run ends once the leader has exited")
         .expect("the run reports the leader's status");
-        drop(workload.contained);
 
         assert_eq!(
             format!("{code:?}"),
@@ -1631,7 +1637,7 @@ while :; do :; done"#
         script: &str,
     ) -> (Result<std::process::ExitCode, BoxError>, Vec<libc::pid_t>) {
         let mut observer = tokio::signal::unix::signal(kind).expect("the test observes the signal");
-        let mut workload = supervised_workload(script, 2).await;
+        let workload = supervised_workload(script, 2).await;
         let pids = workload.pids.clone();
 
         // SAFETY: signalling this process by its own pid.
@@ -1644,7 +1650,6 @@ while :; do :; done"#
         )
         .await
         .expect("the run ends after the signal");
-        drop(workload.contained);
         (outcome, pids)
     }
 

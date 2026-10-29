@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
-/// Why a box refused to run, or stopped running.
+/// Why a Box operation failed.
 #[derive(Debug)]
-pub(crate) struct BoxError(Internal);
+pub struct BoxError(Internal);
 
 impl std::fmt::Display for BoxError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

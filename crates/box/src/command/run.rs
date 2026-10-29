@@ -3,11 +3,11 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use policy::Policy;
 
-use crate::error::{BoxError, ConfigError, DaemonError, Internal};
+use crate::error::{BoxError, ConfigError, DaemonError};
 use crate::record::config::process::ProcessSpec;
 use crate::record::config::{
     AuthoritySource, ConfigureRequest, Record, RunContract, trailing_arguments,
@@ -20,35 +20,6 @@ use crate::run::contain::supervise::Contained;
 use crate::run::hosted::HostedBox;
 use crate::run::lock::Lock;
 use crate::run::telemetry;
-
-static RUNNING_POLICY: Mutex<Option<Arc<policy::PolicyEngine>>> = Mutex::new(None);
-
-pub(crate) fn reload(sources: &[Policy]) -> Result<(), BoxError> {
-    let running = RUNNING_POLICY
-        .lock()
-        .map_err(|_| Internal::ReloadUnavailable)?;
-    let policy = running.as_ref().ok_or(Internal::NoRunningBox)?;
-    policy.reload(sources).map_err(BoxError::from)
-}
-
-struct RunningPolicy;
-
-impl RunningPolicy {
-    fn publish(policy: Arc<policy::PolicyEngine>) -> Self {
-        *RUNNING_POLICY
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(policy);
-        Self
-    }
-}
-
-impl Drop for RunningPolicy {
-    fn drop(&mut self) {
-        *RUNNING_POLICY
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
-    }
-}
 
 /// One locked box, before this run holds any authority over it.
 struct LockedRun {
@@ -188,7 +159,6 @@ async fn hosted(
         .ok_or(ConfigError::EmptyWorkload)?;
     let home = agent_home(&agent)?;
     eprintln!("strands-box: starting workload");
-    let reload_policy = Arc::clone(&policy);
     let hosted = HostedBox::open(
         &locked.root,
         &locked.record,
@@ -254,8 +224,7 @@ async fn hosted(
         &site,
     )?;
     eprintln!("{}", boundary.disclosure());
-    let mut contained = Contained::spawn(boundary, &locked.root, hosted, terminal, signals).await?;
-    let _running_policy = RunningPolicy::publish(reload_policy);
+    let contained = Contained::spawn(boundary, &locked.root, hosted, terminal, signals).await?;
     contained.wait().await
 }
 

@@ -54,11 +54,8 @@ alone**. Each loaded box holds its own authority, so one box's rules never decid
 Authored policy uses the fixed `Box::Agent::"self"` principal and
 `Box::Resource::"unused"` resource.
 
-A Rust library caller can replace that policy during a run with
-`reload(&[Policy]) -> Result<(), ReloadFailed>`. It supplies authored text to the running
-engine without restarting the workload or changing its OS sandbox. The
-[library guide](../../README.md#use-box-as-a-rust-library) states the call's lifetime and
-replacement contract.
+The Rust library's [`reload`](../../README.md#use-box-as-a-rust-library) replaces policy
+during a run.
 
 **The edit-and-run loop replaces a separate configure verb.** Edit the selected policy
 and run again: `run` re-reads the configuration, and when the files differ from the stored record

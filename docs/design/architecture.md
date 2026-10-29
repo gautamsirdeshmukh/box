@@ -47,12 +47,6 @@ to the box rather than to the run, so it carries across runs ([history is durabl
 box](decisions.md#history-is-durable-per-box-and-has-no-rewind)). [Policy](policy.md) covers how a
 request is decided and what a history rule can see.
 
-The library's `reload` function reaches this same engine through a process-local reference.
-The reference is published when workload supervision begins and withdrawn when the run ends.
-Reload calls are serialized, and withdrawal waits for a call already in progress. The caller
-supplies authored text and gets a result; it never receives the engine. Only trusted code in
-the host process can use this path. The workload has no reload command or broker message.
-
 ### The broker
 
 The broker accepts the alias's connections on `run/box.sock`, in the box directory, and it
