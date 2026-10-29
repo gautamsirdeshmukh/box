@@ -11,7 +11,8 @@ use super::{Policy, SchemaStage, authored};
 use crate::check::{Finding, Refused, RuleRef, annotated_id};
 use crate::dogwood::{
     DogwoodEngine, check_canonical_policy_set, check_policy_source, parse_policy_source,
-    policy_is_tool_scoped, validate_canonical_policy_set,
+    policy_is_tool_scoped, refuse_input_across_families_before_discovery,
+    validate_canonical_policy_set,
 };
 use crate::schema::{ActionIdentity, GovernedBox, mcp_action_namespace};
 use crate::spelling::{Operator, PolicyWarning};
@@ -133,6 +134,7 @@ impl Authority {
             discovery_finished: false,
         };
         let complete = proposal.complete_policy_set();
+        refuse_input_across_families_before_discovery(&complete).map_err(Refused::into_error)?;
         let (readiness, pending_tools, warnings) =
             match validate_canonical_policy_set(&complete, &[], operator, &[]) {
                 Ok((effective_schema, warnings)) => {
@@ -144,6 +146,7 @@ impl Authority {
                 }
                 Err(
                     inert @ (PolicyError::Spelling(_)
+                    | PolicyError::InputAcrossFamilies(_)
                     | PolicyError::SharedRuleId(_)
                     | PolicyError::ReservedAction(_)
                     | PolicyError::InertTemporalPermit(_)),
@@ -223,6 +226,7 @@ impl Authority {
 
         let schemas = proposed.schema_sources();
         let complete = proposed.complete_policy_set();
+        refuse_input_across_families_before_discovery(&complete).map_err(Refused::into_error)?;
         let (installed, effective_schema) =
             match validate_canonical_policy_set(&complete, &schemas, &proposed.operator, &[]) {
                 Ok((schema, _)) => {
@@ -774,6 +778,8 @@ pub(super) fn check_staged(
     let unlocated = |findings: Vec<Finding>| -> Vec<Finding> {
         findings.into_iter().map(Finding::without_span).collect()
     };
+    refuse_input_across_families_before_discovery(&proposal.complete_policy_set())
+        .map_err(|refused| unlocated(refused.findings))?;
     match check_canonical_policy_set(&proposal.complete_policy_set(), &[], operator, &[]) {
         Ok((_, warnings)) => return Ok((warnings, Vec::new())),
         Err(refused) if is_inert(&refused.error) => return Err(unlocated(refused.findings)),
@@ -811,6 +817,7 @@ fn is_inert(error: &PolicyError) -> bool {
     matches!(
         error,
         PolicyError::Spelling(_)
+            | PolicyError::InputAcrossFamilies(_)
             | PolicyError::SharedRuleId(_)
             | PolicyError::ReservedAction(_)
             | PolicyError::InertTemporalPermit(_)
@@ -1448,6 +1455,9 @@ when temporal {
                action in [Box::Action::"shell:exec", alpha::Action::"read"], resource);"#,
             r#"forbid(principal, action, resource)
                when { action != alpha::Action::"read" };"#,
+            r#"forbid(principal, action in [alpha::Action::"read", beta::Action::"read"], resource)
+               when { context.input.path == "x" }
+               when temporal { formerly within 60s ( alpha::Action::"read"::request{ input.path: _ } ) };"#,
         ] {
             let mut replacement = discovering_source();
             replacement.extend(source(invalid));
