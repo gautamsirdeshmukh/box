@@ -1,7 +1,17 @@
-//! Process protections and repeat-run refusal through the public library entry point.
+//! Process protections, policy reload, and repeat-run refusal through the library.
+
+#[cfg(unix)]
+#[path = "support/bounded_output.rs"]
+mod bounded_output;
+#[cfg(unix)]
+#[path = "support/fixture.rs"]
+mod fixture;
 
 #[cfg(unix)]
 fn main() {
+    if reload_tests::dispatch() {
+        return;
+    }
     #[cfg(target_os = "linux")]
     if std::env::args().any(|argument| argument == "--linux-refusal") {
         let mut called = false;
@@ -120,10 +130,12 @@ fn main() {
         );
         assert!(!stderr.contains("missing-linux-"), "{stderr}");
     }
+    reload_tests::suite();
 }
 
 #[cfg(unix)]
 fn hardening_and_repeat_run() {
+    reload_tests::assert_not_running();
     let mut limits = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -158,6 +170,7 @@ fn hardening_and_repeat_run() {
         strands_box::RunOptions {
             on_ready: Some(Box::new(|| {
                 called = true;
+                reload_tests::assert_not_running();
                 // SAFETY: getrlimit writes to initialized storage in this isolated probe.
                 assert_eq!(
                     unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limits) },
@@ -184,6 +197,7 @@ fn hardening_and_repeat_run() {
         "callback runs before the missing configuration is rejected"
     );
     assert_eq!(exit_code, std::process::ExitCode::FAILURE);
+    reload_tests::assert_not_running();
 
     // SAFETY: getrlimit writes to the initialized limits value.
     assert_eq!(
@@ -207,4 +221,181 @@ fn hardening_and_repeat_run() {
 #[cfg(not(unix))]
 fn main() {
     eprintln!("skipping: process-protection test requires Unix");
+}
+
+#[cfg(unix)]
+mod reload_tests {
+    use super::{bounded_output, fixture};
+    use std::path::Path;
+    use std::process::{Command, ExitCode};
+    use std::time::{Duration, Instant};
+
+    const ALLOW: &str = "permit(principal, action, resource);";
+    const RESTRICTED: &str = r#"
+    permit(principal, action, resource);
+    forbid(principal, action == Box::Action::"fs:read", resource)
+    when { context.input.path == "~/workspace/target.txt" };
+    "#;
+
+    pub(super) fn dispatch() -> bool {
+        let arguments: Vec<_> = std::env::args().collect();
+        match arguments.get(1).map(String::as_str) {
+            Some("--reload-workload") => workload(),
+            Some("--reload-run") => running_box(Path::new(&arguments[2]), Path::new(&arguments[3])),
+            _ => return false,
+        }
+        true
+    }
+
+    pub(super) fn suite() {
+        if !fixture::namespace_launcher_is_usable() {
+            eprintln!("skipping: live library reload requires a usable containment backend");
+            return;
+        }
+        let executable = tempfile::Builder::new()
+            .prefix("box-reload-probe-")
+            .tempfile_in(fixture::box_binary().parent().unwrap())
+            .unwrap()
+            .into_temp_path();
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let configured = fixture::Request::with_policy("library-reload", RESTRICTED).expect();
+        configured.write_command(executable.to_str().unwrap());
+        std::fs::write(configured.workspace().join("target.txt"), "reload-target\n").unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .arg("--reload-run")
+            .arg(configured.config())
+            .arg(configured.box_home())
+            .env("HOME", configured.operator_home())
+            .env("EXPERIMENTAL_LINUX_SUPPORT", "TRUE");
+        assert_success(command);
+    }
+
+    fn assert_success(command: Command) {
+        let output = bounded_output::bounded_output(command);
+        assert!(
+            output.status.success(),
+            "library reload probe failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn sources(text: &str) -> [strands_box::Policy; 1] {
+        [strands_box::Policy {
+            origin: "library-policy.dw".into(),
+            text: text.to_string(),
+        }]
+    }
+
+    pub(super) fn assert_not_running() {
+        assert_eq!(
+            strands_box::reload(&sources(ALLOW))
+                .unwrap_err()
+                .to_string(),
+            "no box is running in this process"
+        );
+    }
+
+    fn running_box(config: &Path, home: &Path) {
+        assert_not_running();
+        let original = std::fs::read(config.with_file_name("policy.dw")).unwrap();
+        std::thread::scope(|scope| {
+            let mut controller = None;
+            let code = strands_box::run(
+                config.into(),
+                vec!["--reload-workload".into()],
+                strands_box::RunOptions {
+                    on_ready: Some(Box::new(|| {
+                        assert_not_running();
+                        controller = Some(scope.spawn(|| change_policy(home)));
+                        Ok(())
+                    })),
+                    ..Default::default()
+                },
+            );
+            controller.unwrap().join().unwrap();
+            assert_eq!(code, ExitCode::SUCCESS);
+        });
+        assert_not_running();
+        assert_eq!(
+            std::fs::read(config.with_file_name("policy.dw")).unwrap(),
+            original,
+            "reload must not rewrite the selected policy file"
+        );
+    }
+
+    fn change_policy(home: &Path) {
+        wait_until(|| home.join("ready").exists());
+        wait_until(|| match strands_box::reload(&sources(RESTRICTED)) {
+            Ok(()) => true,
+            Err(error) => {
+                assert_eq!(error.to_string(), "no box is running in this process");
+                false
+            }
+        });
+        let mut workload_id = None;
+        for (step, allowed) in [false, true, true, false, false].into_iter().enumerate() {
+            match step {
+                1 => strands_box::reload(&sources(ALLOW)).unwrap(),
+                2 => {
+                    for invalid in [
+                        "this is not a policy",
+                        r#"permit(principal, action == Box::Action::"not:declared", resource);"#,
+                    ] {
+                        assert!(strands_box::reload(&sources(invalid)).is_err());
+                    }
+                }
+                3 => strands_box::reload(&sources(RESTRICTED)).unwrap(),
+                4 => strands_box::reload(&[]).unwrap(),
+                _ => {}
+            }
+            std::fs::write(home.join(format!("request-{step}")), "").unwrap();
+            let response = home.join(format!("response-{step}"));
+            wait_until(|| response.exists());
+            let (id, success, stdout, stderr): (u32, bool, String, String) =
+                serde_json::from_slice(&std::fs::read(response).unwrap()).unwrap();
+            assert_eq!(*workload_id.get_or_insert(id), id);
+            assert_eq!(success, allowed, "step {step}: {stdout}\n{stderr}");
+            if allowed {
+                assert_eq!(stdout, "reload-target\n");
+            } else {
+                assert!(
+                    stderr.contains("policy denied") || stderr.contains("default-deny"),
+                    "step {step} must fail at policy: {stderr}"
+                );
+            }
+        }
+    }
+
+    fn workload() {
+        let home = std::env::var_os("HOME").unwrap();
+        let home = Path::new(&home);
+        assert_not_running();
+        std::fs::write(home.join("ready"), "").unwrap();
+        for step in 0..5 {
+            wait_until(|| home.join(format!("request-{step}")).exists());
+            let output = Command::new("bash")
+                .args(["-c", "cat target.txt"])
+                .output()
+                .unwrap();
+            let response = serde_json::to_vec(&(
+                std::process::id(),
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+            .unwrap();
+            let staged = home.join("response-staged");
+            std::fs::write(&staged, response).unwrap();
+            std::fs::rename(staged, home.join(format!("response-{step}"))).unwrap();
+        }
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready() {
+            assert!(Instant::now() < deadline, "library reload probe timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }

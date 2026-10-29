@@ -27,6 +27,12 @@ impl<E: Into<Internal>> From<E> for BoxError {
 /// Anything that stops a box from running, one variant per owning phase or mechanism.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Internal {
+    #[error("no box is running in this process")]
+    NoRunningBox,
+
+    #[error("the running box's reload state is unavailable")]
+    ReloadUnavailable,
+
     #[error(transparent)]
     Config(#[from] ConfigError),
 

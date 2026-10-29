@@ -1448,7 +1448,7 @@ while :; do :; done"#
             )
         })
         .expect("the workload boundary translates");
-        let contained =
+        let mut contained =
             crate::run::contain::supervise::Contained::testing_spawn_uncontained(boundary, hosted)
                 .await
                 .expect("the supervised workload starts");
@@ -1469,6 +1469,15 @@ while :; do :; done"#
             .await
             .expect("the fatal staging failure stops the supervised workload")
             .expect_err("the run must report the durable staging failure");
+        assert!(
+            BoxLive::read(&root).is_some(),
+            "waiting retains live state until its owner is dropped"
+        );
+        assert!(
+            Lock::is_held(&root.lock()).expect("the retained lock state reads"),
+            "waiting retains the box lock so pending reloads can finish"
+        );
+        drop(contained);
         assert!(
             failure
                 .to_string()
@@ -1585,7 +1594,7 @@ while :; do :; done"#
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_normal_exit_ends_the_descendants_the_leader_left_behind() {
-        let workload = supervised_workload(
+        let mut workload = supervised_workload(
             r#"trap '' TERM; sleep 3600 & printf '%s %s' "$$" "$!" > "$1"; exit 0"#,
             2,
         )
@@ -1599,6 +1608,7 @@ while :; do :; done"#
         .await
         .expect("the run ends once the leader has exited")
         .expect("the run reports the leader's status");
+        drop(workload.contained);
 
         assert_eq!(
             format!("{code:?}"),
@@ -1621,7 +1631,7 @@ while :; do :; done"#
         script: &str,
     ) -> (Result<std::process::ExitCode, BoxError>, Vec<libc::pid_t>) {
         let mut observer = tokio::signal::unix::signal(kind).expect("the test observes the signal");
-        let workload = supervised_workload(script, 2).await;
+        let mut workload = supervised_workload(script, 2).await;
         let pids = workload.pids.clone();
 
         // SAFETY: signalling this process by its own pid.
@@ -1634,6 +1644,7 @@ while :; do :; done"#
         )
         .await
         .expect("the run ends after the signal");
+        drop(workload.contained);
         (outcome, pids)
     }
 

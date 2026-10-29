@@ -91,6 +91,29 @@ Call it before starting application threads or loading secrets, and use one Box 
 per host process. Later `run` calls fail, even if the first call failed.
 Ship the matching Box helper binaries beside the host application.
 
+To replace the running box's policy from a host thread:
+
+```rust,no_run
+fn replace_policy(text: String) -> Result<(), strands_box::ReloadFailed> {
+    strands_box::reload(&[strands_box::Policy {
+        origin: "operator-policy.dw".into(),
+        text,
+    }])
+}
+```
+
+`reload` replaces the complete authored policy set on the existing engine. It returns after
+the replacement is accepted, or returns an error and keeps the previous policy. An empty
+slice installs default-deny. `Policy::origin` labels diagnostics; the API reads no file and
+does not rewrite the configuration or policy files. The next run reads those files again.
+
+Call `reload` only from trusted host code while `run` supervises the workload. It refuses
+calls before supervision and after `run` returns, including when startup fails. `on_ready`
+runs before workload setup, so a direct reload inside that callback is too early. The call can
+block during validation and installation; a terminal application should use a host worker.
+The workload and its OS sandbox stay in place. Reload keeps the existing engine's history
+and discovered schemas; it does not revoke operations already authorized.
+
 To generate policy schemas:
 
 ```rust,no_run

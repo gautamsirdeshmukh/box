@@ -554,7 +554,7 @@ impl Contained {
 
     /// Wait for the workload, forwarding `SIGINT` and stopping it on `SIGTERM` or `SIGHUP`, and
     /// report its exit code.
-    pub(crate) async fn wait(mut self) -> Result<ExitCode, BoxError> {
+    pub(crate) async fn wait(&mut self) -> Result<ExitCode, BoxError> {
         // Release the box's copy of the status pipe first: until it is closed the
         // read below would block on the box itself.
         self.trampoline.close_setup_writer();

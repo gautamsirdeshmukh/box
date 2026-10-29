@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use command::cli::{Cli, Command, PolicyCommand};
 
-pub use policy::{Finding, Location, PolicyCheck, RuleRef};
+pub use policy::{Finding, Location, Policy, PolicyCheck, RuleRef};
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -50,6 +50,16 @@ pub fn run(config: PathBuf, workload: Vec<OsString>, options: RunOptions<'_>) ->
         options,
     )
 }
+
+/// Replace the running box's authored policies with the supplied text.
+pub fn reload(sources: &[Policy]) -> Result<(), ReloadFailed> {
+    command::run::reload(sources).map_err(ReloadFailed)
+}
+
+/// A policy replacement that could not complete.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct ReloadFailed(error::BoxError);
 
 /// Check the policy that a Box configuration selects, as a box checks it when it opens.
 pub fn check_policy(config: PathBuf) -> Result<PolicyCheck, CheckFailed> {
