@@ -536,7 +536,6 @@ pub(crate) fn check_policy_source(source: &str) -> Result<Vec<String>, Refused> 
         .collect())
 }
 
-/// Whether every action in a rule's scope is a typed MCP action.
 pub(crate) fn policy_is_tool_scoped(source: &str) -> Result<bool, PolicyError> {
     use dogwood_language::ActionConstraint;
 

@@ -195,10 +195,6 @@ impl Authority {
 
     /// Re-install an authored policy set over the live engine, keeping this box's decision
     /// history and the MCP schemas this run already discovered.
-    ///
-    /// Validation precedes installation; a refused replacement leaves the current policy in place.
-    /// During discovery, rules awaiting tool definitions stay pending and their tools stay blocked.
-    /// After discovery, the complete replacement must validate.
     pub(super) fn reload(&self, sources: &[Policy]) -> Result<(), PolicyStagingError> {
         // Same order as `stage_mcp_schema`: proposal first, then live. A reload that took them
         // the other way round would deadlock against a schema staging mid-discovery.

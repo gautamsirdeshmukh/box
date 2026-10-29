@@ -918,12 +918,6 @@ constraint. Each accepted schema installs a fuller set, and the last one makes t
 Every install retains unchanged policy identities and their temporal state, so an incremental install
 replays no history.
 
-`reload` uses the same pending-rule behavior until discovery finishes. The policy engine remembers
-the coordinator's completion notification separately from readiness, because a policy with no typed
-rules can be ready before any tool list arrives. A reload after that notification must validate in full.
-Only rules scoped to typed tool actions may remain pending after reload, because the pending-tool
-guard cannot enforce a rule's restrictions on non-tool actions.
-
 <a id="a-server-whose-discovery-a-policy-denies-degrades-alone"></a>
 ### A server whose discovery a policy denies degrades alone
 

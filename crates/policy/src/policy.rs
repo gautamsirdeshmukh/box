@@ -257,7 +257,6 @@ impl PolicyEngine {
     }
 
     /// Re-install an authored policy set over this live authority.
-    /// During discovery, rules awaiting tool definitions stay pending and their tools stay blocked.
     ///
     /// The box's decision history is kept, so temporal budgets and rate counters accumulated
     /// before the reload still apply after it. A rule whose canonical text is unchanged keeps
