@@ -32,7 +32,7 @@ use policy::{
     EgressPolicyInterceptor, GovernedBox, McpServerKind, PolicyEngine, Principal, ToolCatalogs,
 };
 
-use crate::error::{BoxError, ConfigError, DaemonError, Internal};
+use crate::error::{BoxError, ConfigError, DaemonError};
 use crate::record::config::process::ProcessSpec;
 use crate::record::config::{AuthoritySource, Record};
 use crate::record::layout::BoxRoot;
@@ -52,8 +52,12 @@ static RUNNING_POLICY: Mutex<Option<Arc<PolicyEngine>>> = Mutex::new(None);
 pub(crate) fn reload(sources: &[policy::Policy]) -> Result<(), BoxError> {
     let running = RUNNING_POLICY
         .lock()
-        .map_err(|_| Internal::ReloadUnavailable)?;
-    let policy = running.as_ref().ok_or(Internal::NoRunningBox)?;
+        .map_err(|error| DaemonError::Refused {
+            reason: error.to_string(),
+        })?;
+    let policy = running.as_ref().ok_or_else(|| DaemonError::Refused {
+        reason: "no box is running in this process".into(),
+    })?;
     policy.reload(sources).map_err(BoxError::from)
 }
 

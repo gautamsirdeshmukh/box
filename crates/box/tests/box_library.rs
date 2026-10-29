@@ -286,7 +286,7 @@ mod reload_tests {
     pub(super) fn assert_not_running() {
         assert_eq!(
             strands_box::reload(&[]).unwrap_err().to_string(),
-            "no box is running in this process"
+            "the trusted Box operation refused: no box is running in this process"
         );
     }
 
