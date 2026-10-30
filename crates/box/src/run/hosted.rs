@@ -47,15 +47,18 @@ use crate::run::credential;
 use crate::run::lock::{BoxLive, Lock};
 use crate::run::telemetry;
 
-static RUNNING_POLICY: Mutex<Option<(Arc<PolicyEngine>, Arc<telemetry::Collector>)>> =
-    Mutex::new(None);
+type RunningPolicy = (Arc<PolicyEngine>, Arc<telemetry::Collector>, Vec<String>);
+
+static RUNNING_POLICY: Mutex<Option<RunningPolicy>> = Mutex::new(None);
 
 pub(crate) fn reload(sources: &[policy::Policy]) -> Result<(), BoxError> {
     let running = RUNNING_POLICY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (policy, collector) = running.as_ref().ok_or(DaemonError::NotRunning)?;
-    let result = policy.reload(sources).map_err(BoxError::from);
+    let (policy, collector, mcp_servers) = running.as_ref().ok_or(DaemonError::NotRunning)?;
+    let result = policy
+        .reload_with_mcp_servers(sources, mcp_servers)
+        .map_err(BoxError::from);
     let subject = telemetry::policy_subject(sources);
     collector.control(match &result {
         Ok(()) => telemetry::ControlRecord::completed(
@@ -778,7 +781,16 @@ impl HostedBox {
         let published = PublishedRecord(root.clone());
         *RUNNING_POLICY
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some((policy, Arc::clone(&collector)));
+            .unwrap_or_else(|error| error.into_inner()) = Some((
+            policy,
+            Arc::clone(&collector),
+            record
+                .mcp
+                .iter()
+                .map(|server| server.name.clone())
+                .chain(record.mcp_servers().into_iter().map(|(_, name)| name))
+                .collect(),
+        ));
         Ok(Self {
             discovery: Some(discovery),
             broker: Some(broker),

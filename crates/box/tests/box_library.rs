@@ -371,7 +371,12 @@ mod reload_tests {
             .unwrap()
             .into_temp_path();
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-        let configured = fixture::Request::with_policy("library-reload", RESTRICTED).expect();
+        let configured = fixture::Request::with_config(
+            "library-reload",
+            RESTRICTED,
+            "[mcp.alpha-mcp]\ntype = \"stdio\"\ncommand = [\"echo\"]\n",
+        )
+        .expect();
         configured.write_command(executable.to_str().unwrap());
         std::fs::write(configured.workspace().join("target.txt"), "reload-target\n").unwrap();
         let mut command = Command::new(&executable);
@@ -423,8 +428,11 @@ mod reload_tests {
             reloads,
             [
                 "policy_installed ok library-policy.dw",
+                "policy_installed ok library-policy.dw",
                 "policy_refused refused library-policy.dw",
                 "policy_refused refused library-policy.dw",
+                "policy_refused refused library-policy.dw",
+                "policy_installed ok library-policy.dw",
                 "policy_installed ok library-policy.dw",
                 "policy_installed ok <no authored policy>",
             ]
@@ -439,10 +447,7 @@ mod reload_tests {
     }
 
     pub(super) fn assert_not_running() {
-        assert_eq!(
-            strands_box::reload(&[]).unwrap_err().to_string(),
-            "no box is running in this process"
-        );
+        assert!(strands_box::reload(&[]).unwrap_err().is_not_running());
     }
 
     fn running_box(config: &Path, home: &Path) {
@@ -472,7 +477,17 @@ mod reload_tests {
     }
 
     fn change_policy(home: &Path) {
-        wait_for(&home.join("ready"));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match strands_box::reload(&sources(RESTRICTED)) {
+                Ok(()) => break,
+                Err(error) if error.is_not_running() => {
+                    assert!(Instant::now() < deadline, "box did not open: {error}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("initial reload failed: {error}"),
+            }
+        }
         for step in 0..5 {
             match step {
                 1 => strands_box::reload(&sources(ALLOW)).unwrap(),
@@ -480,9 +495,17 @@ mod reload_tests {
                     for invalid in [
                         "this is not a policy",
                         r#"permit(principal, action == Box::Action::"not:declared", resource);"#,
+                        r#"permit(principal, action, resource);
+                           forbid(principal, action == alpah::Action::"read", resource);"#,
                     ] {
-                        assert!(strands_box::reload(&sources(invalid)).is_err());
+                        let error = strands_box::reload(&sources(invalid)).unwrap_err();
+                        assert!(!error.is_not_running(), "{error}");
                     }
+                    strands_box::reload(&sources(
+                        r#"permit(principal, action, resource);
+                           forbid(principal, action == alpha_mcp::Action::"read", resource);"#,
+                    ))
+                    .unwrap();
                 }
                 3 => strands_box::reload(&sources(RESTRICTED)).unwrap(),
                 4 => strands_box::reload(&[]).unwrap(),
@@ -497,7 +520,6 @@ mod reload_tests {
         let home = std::env::var_os("HOME").unwrap();
         let home = Path::new(&home);
         assert_not_running();
-        std::fs::write(home.join("ready"), "").unwrap();
         for (step, allowed) in [false, true, true, false, false].into_iter().enumerate() {
             wait_for(&home.join(format!("request-{step}")));
             let output = Command::new("bash")
