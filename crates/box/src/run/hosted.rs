@@ -56,9 +56,7 @@ pub(crate) fn reload(sources: &[policy::Policy]) -> Result<(), BoxError> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (policy, collector, mcp_servers) = running.as_ref().ok_or(DaemonError::NotRunning)?;
-    let result = policy
-        .reload_with_mcp_servers(sources, mcp_servers)
-        .map_err(BoxError::from);
+    let result = policy.reload(sources, mcp_servers).map_err(BoxError::from);
     let subject = telemetry::policy_subject(sources);
     collector.control(match &result {
         Ok(()) => telemetry::ControlRecord::completed(

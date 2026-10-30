@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-/// Why a Box operation failed.
+/// Why a box refused to run or reload, or stopped running.
 #[derive(Debug)]
 pub struct BoxError(Internal);
 

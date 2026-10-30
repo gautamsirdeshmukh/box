@@ -52,8 +52,8 @@ PolicyEngine::record(&GovernedBox, &Principal, &Outcome<'_>) -> Result<(), Polic
 PolicyEngine::effective() -> &EffectivePolicy
 ```
 
-`reload` replaces the rules using the schemas already loaded. `reload_with_mcp_servers` also
-allows rules to wait for the named servers during discovery.
+`reload(&policies, &mcp_servers)` replaces the rules. During discovery, tool rules can wait
+for the configured servers.
 
 `decide` and `record` each take the box that owns the authority. Construct one with
 `GovernedBox::assigned("<box name>")` from the endpoint you own. The value remains

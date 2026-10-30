@@ -268,12 +268,7 @@ impl PolicyEngine {
     /// The caller owns the question of *who* may ask for this. Nothing here authenticates a
     /// request: the contained agent must never reach a reload, and the only thing that keeps
     /// it out is where the trigger lives.
-    pub fn reload(&self, sources: &[Policy]) -> Result<(), PolicyStagingError> {
-        self.authority.reload(sources, &[])
-    }
-
-    /// Reload with rules allowed to await discovery of the declared MCP servers.
-    pub fn reload_with_mcp_servers(
+    pub fn reload(
         &self,
         sources: &[Policy],
         mcp_servers: &[String],
@@ -1218,7 +1213,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
         );
 
         engine
-            .reload(&read_and_write)
+            .reload(&read_and_write, &[])
             .expect("the second policy reloads onto the live engine");
 
         assert!(
@@ -1244,7 +1239,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
         );
 
         engine
-            .reload(&source("this is not a policy {{{"))
+            .reload(&source("this is not a policy {{{"), &[])
             .expect_err("a policy that does not parse is refused");
 
         assert!(
@@ -1255,6 +1250,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
 
     #[test]
     fn reload_rejects_invalid_tool_rules_and_preserves_the_forbid() {
+        let mcp_servers = ["alpha".into(), "beta".into()];
         let history = tempfile::tempdir().expect("history directory");
         let engine = PolicyEngine::open_staged(
             &Operator::unanchored(),
@@ -1266,10 +1262,13 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
         let beta = mcp_fragment("beta", "read");
         engine.stage_mcp_schema("alpha", alpha.clone()).unwrap();
         engine
-            .reload(&source(
-                r#"permit(principal, action, resource);
-                   forbid(principal, action == alpha::Action::"read", resource);"#,
-            ))
+            .reload(
+                &source(
+                    r#"permit(principal, action, resource);
+                       forbid(principal, action == alpha::Action::"read", resource);"#,
+                ),
+                &mcp_servers,
+            )
             .unwrap();
         let call = || {
             engine.refine_tool_call(
@@ -1297,12 +1296,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
                 )
                 .is_err()
             );
-            assert!(
-                engine
-                    .reload_with_mcp_servers(&replacement, &["alpha".into(), "beta".into()])
-                    .is_err(),
-                "{rule}"
-            );
+            assert!(engine.reload(&replacement, &mcp_servers).is_err(), "{rule}");
             assert!(!call().is_allow(), "the original forbid must remain active");
         }
         engine.finish_mcp_discovery().unwrap();
@@ -1314,6 +1308,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
 
     #[test]
     fn a_reloaded_pending_forbid_stays_denied_after_discovery() {
+        let mcp_servers = ["alpha".into(), "beta".into()];
         let tool = r#"read."wiki":item"#;
         let history = tempfile::tempdir().expect("history directory");
         let engine = PolicyEngine::open_staged(
@@ -1338,9 +1333,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
             &[alpha, beta],
         )
         .unwrap();
-        engine
-            .reload_with_mcp_servers(&replacement, &["alpha".into(), "beta".into()])
-            .unwrap();
+        engine.reload(&replacement, &mcp_servers).unwrap();
         let call = || {
             engine.refine_tool_call(
                 &GovernedBox::assigned("test-box"),
@@ -1362,7 +1355,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
             !call().is_allow(),
             "an unresolved forbid must keep the tool blocked"
         );
-        assert!(engine.reload(&replacement).is_err());
+        assert!(engine.reload(&replacement, &mcp_servers).is_err());
         assert!(
             !call().is_allow(),
             "a refused reload must preserve the block"
@@ -1372,7 +1365,7 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
             r#"permit(principal, action, resource);
                permit(principal, action == alpha::Action::"read.\"wiki\":item", resource);"#,
         ] {
-            engine.reload(&source(replacement)).unwrap();
+            engine.reload(&source(replacement), &mcp_servers).unwrap();
             assert!(
                 call().is_allow(),
                 "the old block must not survive a valid replacement"

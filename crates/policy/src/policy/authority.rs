@@ -195,6 +195,12 @@ impl Authority {
 
     /// Re-install an authored policy set over the live engine, keeping this box's decision
     /// history and the MCP schemas this run already discovered.
+    ///
+    /// Validation runs before the live lock is taken, so rejected text costs no decision latency
+    /// and leaves the previous authority serving every request. During
+    /// discovery, `reload` may install the validated subset and keep tool rules pending
+    /// until their configured servers' schemas arrive. After discovery, the authored set is
+    /// replaced wholesale and refused wholesale.
     pub(super) fn reload(
         &self,
         sources: &[Policy],
@@ -439,6 +445,10 @@ impl Authority {
                 {
                     return Decision::no_match();
                 }
+                // Guard: hold a `tools/call` whose per-tool typed rule has not staged
+                // yet — its constraint is not enforceable, so deny transiently rather than
+                // let it ride the coarse permit unconstrained. Everything else (the model, other
+                // tools, `tools/list`) is decided against the committed validated subset.
                 if live.readiness == Readiness::Discovering
                     && let ActionIdentity::McpTool { namespace, tool } = identity
                     && live
@@ -459,6 +469,7 @@ impl Authority {
                     Decision::no_match()
                 };
                 match decision {
+                    // No per-tool rule matched: ride the coarse `mcp:call` allow rather than default-denying.
                     Decision::Deny {
                         reason: crate::DenyReason::NoMatch,
                         ..
@@ -467,6 +478,7 @@ impl Authority {
                         attribution: Vec::new(),
                         resource: String::new(),
                     },
+                    // An explicit `forbid`, an internal fault, or an allow — enforce as decided.
                     other => other,
                 }
             }
@@ -697,7 +709,9 @@ fn pending_typed_tools(proposal: &ProposalState) -> BTreeSet<(String, String)> {
     out
 }
 
-/// Extracts typed actions outside the fixed `Box::Action` vocabulary.
+/// Extracts every `<ns>::Action::"<tool>"` typed action from a macro-expanded policy source,
+/// excluding the fixed `Box::Action` vocabulary. A scan for the marker recovers the full
+/// namespace, and Cedar parses the action to decode the tool name.
 fn collect_typed_actions(source: &str, out: &mut BTreeSet<(String, String)>) {
     const MARKER: &str = "::Action::\"";
     let mut rest = source;
