@@ -550,7 +550,9 @@ pub(crate) fn policy_is_tool_scoped(source: &str) -> Result<bool, PolicyError> {
         .all(|policy| match policy.scope().action() {
             ActionConstraint::Any => false,
             ActionConstraint::Eq(uid) => is_tool(uid),
-            ActionConstraint::In(uids) => !uids.is_empty() && uids.iter().all(is_tool),
+            ActionConstraint::In(uids) => uids.first().is_some_and(|first| {
+                is_tool(first) && uids.iter().all(|uid| uid.type_name() == first.type_name())
+            }),
         }))
 }
 

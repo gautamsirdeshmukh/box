@@ -389,7 +389,7 @@ impl PolicyEngine {
             Decision::Deny {
                 reason: crate::DenyReason::NoMatch,
                 ..
-            } => Decision::Allow {
+            } if !self.authority.is_tool_degraded(&identity) => Decision::Allow {
                 rule: crate::RuleId::default_deny(),
                 attribution: Vec::new(),
                 resource: String::new(),
@@ -1280,6 +1280,110 @@ forbid(principal, action == issues_mcp::Action::"read", resource);
         assert!(
             write_allowed(&engine, &target),
             "the refused reload validated before the live lock, so the previous policy serves"
+        );
+    }
+
+    #[test]
+    fn reload_rejects_mixed_tool_action_types_and_preserves_the_forbid() {
+        let history = tempfile::tempdir().expect("history directory");
+        let engine = PolicyEngine::open_staged(
+            &Operator::unanchored(),
+            source("permit(principal, action, resource);"),
+            &history.path().join("dogwood.redb"),
+        )
+        .unwrap();
+        let alpha = mcp_fragment("alpha", "read");
+        let beta = mcp_fragment("beta", "read");
+        engine.stage_mcp_schema("alpha", alpha.clone()).unwrap();
+        engine
+            .reload(&source(
+                r#"permit(principal, action, resource);
+                   forbid(principal, action == alpha::Action::"read", resource);"#,
+            ))
+            .unwrap();
+        let call = || {
+            engine.refine_tool_call(
+                &GovernedBox::assigned("test-box"),
+                &Principal::agent(),
+                "alpha",
+                "read",
+                &serde_json::json!({"path": "/workspace/input"}),
+            )
+        };
+        assert!(!call().is_allow());
+
+        for actions in [
+            r#"alpha::Action::"read", beta::Action::"read""#,
+            r#"beta::Action::"read", alpha::Action::"read""#,
+        ] {
+            let replacement = source(&format!(
+                "permit(principal, action, resource);
+                 forbid(principal, action in [{actions}], resource);"
+            ));
+            assert!(
+                PolicyEngine::validate_with_mcp_schemas(
+                    &Operator::unanchored(),
+                    &replacement,
+                    &[alpha.clone(), beta.clone()],
+                )
+                .is_err()
+            );
+            assert!(engine.reload(&replacement).is_err());
+            assert!(!call().is_allow(), "the original forbid must remain active");
+        }
+        engine.finish_mcp_discovery().unwrap();
+        assert!(
+            !call().is_allow(),
+            "discovery must preserve the original forbid"
+        );
+    }
+
+    #[test]
+    fn a_reloaded_pending_forbid_stays_denied_after_discovery() {
+        let history = tempfile::tempdir().expect("history directory");
+        let engine = PolicyEngine::open_staged(
+            &Operator::unanchored(),
+            source("permit(principal, action, resource);"),
+            &history.path().join("dogwood.redb"),
+        )
+        .unwrap();
+        let alpha = mcp_fragment("alpha", "read");
+        let beta = mcp_fragment("beta", "read");
+        engine.stage_mcp_schema("alpha", alpha.clone()).unwrap();
+        let replacement = source(
+            r#"permit(principal, action, resource);
+               forbid(principal, action == alpha::Action::"read", resource)
+               when temporal {
+                   formerly within 60s (beta::Action::"read"::request{ input.path: _ })
+               };"#,
+        );
+        PolicyEngine::validate_with_mcp_schemas(
+            &Operator::unanchored(),
+            &replacement,
+            &[alpha, beta],
+        )
+        .unwrap();
+        engine.reload(&replacement).unwrap();
+        let call = || {
+            engine.refine_tool_call(
+                &GovernedBox::assigned("test-box"),
+                &Principal::agent(),
+                "alpha",
+                "read",
+                &serde_json::json!({"path": "/workspace/input"}),
+            )
+        };
+        assert!(matches!(
+            call(),
+            Decision::Deny {
+                reason: crate::DenyReason::PolicyPending,
+                ..
+            }
+        ));
+        engine.finish_mcp_discovery().unwrap();
+        assert!(
+            !call().is_allow(),
+            "an unresolved forbid must keep the tool blocked"
         );
     }
 }
