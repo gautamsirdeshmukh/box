@@ -156,7 +156,7 @@ pub fn event_schema_source() -> &'static str {
     EVENTS_DWSCHEMA
 }
 
-fn service_schema() -> Result<ServiceSchema, PolicyError> {
+pub(crate) fn service_schema() -> Result<ServiceSchema, PolicyError> {
     ServiceSchema::builder()
         .event_schema_str(EVENTS_DWSCHEMA)
         .build()
@@ -711,7 +711,17 @@ pub(crate) fn check_and_expand(
     // belongs; a parse fault also becomes a load error rather than a first-request
     // deny.
     let effective_schema = action_schema(mcp_schemas)?;
+    check_against(source, effective_schema, operator, authored, positions)
+}
 
+/// Parse and validate a bundle against `effective_schema`, keeping the findings of a refusal.
+pub(crate) fn check_against(
+    source: &str,
+    effective_schema: ActionSchema,
+    operator: &Operator,
+    authored: bool,
+    positions: &[usize],
+) -> Result<(Vec<String>, crate::schema::ActionSchema, Vec<PolicyWarning>), Refused> {
     let policy_schema = PolicySchema::from_cedarschema_str(&effective_schema.source)
         .map_err(|error| PolicyError::Schema(format!("dogwood action schema: {error}")))?;
 
@@ -1407,12 +1417,19 @@ fn credential_read_fields(paths: &[String]) -> Vec<(&'static str, Value)> {
 /// The `input` fields of a response or error event.
 fn outcome_fields(outcome: &Outcome<'_>) -> Vec<(&'static str, Value)> {
     match outcome {
-        // Only schema-declared fields may appear; a field the schema does not know is
-        // a hard load error. Whether the socket opened is carried by the event KIND
-        // (`response` vs `error`), so the fields record the attempt's identity.
-        Outcome::Connect { host, port, .. } => vec![
+        // Whether the socket opened is carried by the event KIND (`response` vs `error`).
+        Outcome::Connect {
+            host,
+            port,
+            address,
+            ..
+        } => vec![
             (attr::HOST, Value::String((*host).to_string())),
             (attr::PORT, Value::Int(i64::from(*port))),
+            (
+                attr::IP,
+                Value::String(crate::address::canonical(address.ip())),
+            ),
         ],
         Outcome::Http {
             host,
@@ -1420,6 +1437,7 @@ fn outcome_fields(outcome: &Outcome<'_>) -> Vec<(&'static str, Value)> {
             method,
             path,
             delivery,
+            intercepted,
             ..
         } => vec![
             (attr::HOST, Value::String((*host).to_string())),
@@ -1432,7 +1450,7 @@ fn outcome_fields(outcome: &Outcome<'_>) -> Vec<(&'static str, Value)> {
                 attr::BODY_BYTES,
                 Value::Int(clamp(delivery.accepted_bytes())),
             ),
-            (attr::INTERCEPTED, Value::Bool(true)),
+            (attr::INTERCEPTED, Value::Bool(*intercepted)),
         ],
         Outcome::ShellRun {
             command,
@@ -2007,6 +2025,7 @@ when temporal {
             path: "/v1",
             delivery: crate::Delivery::Completed { bytes },
             status: Some(200),
+            intercepted: true,
         }
     }
 
@@ -2078,6 +2097,7 @@ when temporal {
                         path: "/v1",
                         delivery: crate::Delivery::Completed { bytes: 10 },
                         status: Some(200),
+                        intercepted: true,
                     }
                 )
                 .is_err(),
@@ -2163,6 +2183,7 @@ when temporal {
             path: "/v1",
             delivery: crate::Delivery::Completed { bytes: 150 },
             status: Some(200),
+            intercepted: true,
         };
         assert!(
             engine
