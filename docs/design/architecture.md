@@ -301,6 +301,10 @@ part of what you have to trust.
    These mappings preserve configured access without adding executable or library authority.
    The [configuration reference](../user/config.md#agentfilesystem-and-toolnamefilesystem) shows the emitted form.
 7. **It starts the trampoline**, which becomes the agent, and then it waits.
+   For a terminal run, the agent retains its original terminal streams. Core redirects its own
+   stderr to a reader that retains up to 32 KiB and drains the rest. After the workload and hosted
+   services stop, Core restores stderr and prints the retained messages. It reports any truncation.
+   Piped runs keep live diagnostics. A caller-supplied terminal uses the same deferred output.
 
 Teardown runs in the reverse direction, and the order is the point. The workload is reaped first, so
 nothing contained is alive while the box's authority is still up. Then the broker unbinds, the gateway
